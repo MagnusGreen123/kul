@@ -7,7 +7,7 @@ Supports mixed precision training via torch.cuda.amp.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 import sys
 sys.path.insert(0, ".")
@@ -115,7 +115,7 @@ class WorldModelTrainer:
         self.use_amp = cfg.get("mixed_precision", False) and device.type == "cuda"
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, eps=1e-5)
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler("cuda", enabled=self.use_amp)
 
     def train_step(self, batch: dict) -> dict:
         """Single training step.

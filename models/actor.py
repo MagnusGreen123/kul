@@ -1,0 +1,87 @@
+"""
+Actor MLP: (h, z) -> action distribution.
+Supports discrete (Categorical) and continuous (TanhNormal) actions.
+"""
+
+import torch
+import torch.nn as nn
+from torch.distributions import Categorical, Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
+
+
+class Actor(nn.Module):
+    def __init__(self, hidden_dim: int = 256, stoch_dim: int = 32,
+                 act_dim: int = 4, units: int = 256, discrete: bool = True):
+        super().__init__()
+        self.discrete = discrete
+        self.act_dim = act_dim
+
+        self.trunk = nn.Sequential(
+            nn.Linear(hidden_dim + stoch_dim, units),
+            nn.ELU(),
+            nn.Linear(units, units),
+            nn.ELU(),
+        )
+
+        if discrete:
+            self.head = nn.Linear(units, act_dim)
+        else:
+            self.mean_head = nn.Linear(units, act_dim)
+            self.log_std_head = nn.Linear(units, act_dim)
+
+    def forward(self, h: torch.Tensor, z: torch.Tensor):
+        """
+        Returns:
+            dist: action distribution
+        """
+        x = self.trunk(torch.cat([h, z], dim=-1))
+
+        if self.discrete:
+            logits = self.head(x)
+            return Categorical(logits=logits)
+        else:
+            mean = self.mean_head(x)
+            log_std = self.log_std_head(x).clamp(-5, 2)
+            std = log_std.exp()
+            base_dist = Normal(mean, std)
+            return TransformedDistribution(base_dist, [TanhTransform(cache_size=1)])
+
+    def get_action(self, h: torch.Tensor, z: torch.Tensor):
+        """Sample action and return (action, log_prob).
+
+        For discrete: returns one-hot action tensor for RSSM input.
+        """
+        dist = self.forward(h, z)
+
+        if self.discrete:
+            action_idx = dist.sample()
+            log_prob = dist.log_prob(action_idx)
+            # One-hot for feeding back into RSSM
+            action_onehot = torch.zeros(*action_idx.shape, self.act_dim,
+                                        device=h.device)
+            action_onehot.scatter_(-1, action_idx.unsqueeze(-1), 1.0)
+            return action_onehot, log_prob
+        else:
+            action = dist.rsample()
+            log_prob = dist.log_prob(action).sum(-1)
+            return action, log_prob
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Test discrete
+    actor_d = Actor(hidden_dim=256, stoch_dim=32, act_dim=4, discrete=True).to(device)
+    h = torch.randn(8, 256, device=device)
+    z = torch.randn(8, 32, device=device)
+    action, log_prob = actor_d.get_action(h, z)
+    print(f"Discrete action: {action.shape}, log_prob: {log_prob.shape}")
+
+    # Test continuous
+    actor_c = Actor(hidden_dim=256, stoch_dim=32, act_dim=2, discrete=False).to(device)
+    action, log_prob = actor_c.get_action(h, z)
+    print(f"Continuous action: {action.shape}, log_prob: {log_prob.shape}")
+
+    print(f"Discrete params:   {sum(p.numel() for p in actor_d.parameters()):,}")
+    print(f"Continuous params:  {sum(p.numel() for p in actor_c.parameters()):,}")
+    print("Smoke test passed!")

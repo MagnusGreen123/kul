@@ -143,15 +143,28 @@ if __name__ == "__main__":
         env = make_atari_env("ALE/Pong-v5")
         env_name = "ALE/Pong-v5"
     except Exception:
-        # Fallback if Atari ROMs not installed
-        print("Atari not available, testing with CartPole RGB wrapper")
-        env = gym.make("CartPole-v1", render_mode="rgb_array")
-        env = GrayscaleWrapper(gym.wrappers.PixelObservationWrapper(env))
+        # Fallback: generate random pixel obs to test the wrapper pipeline
+        print("Atari not available, testing with dummy pixel obs")
+
+        class DummyPixelEnv(gym.Env):
+            """Minimal env that returns random RGB frames."""
+            def __init__(self):
+                self.observation_space = spaces.Box(0, 255, shape=(210, 160, 3), dtype=np.uint8)
+                self.action_space = spaces.Discrete(2)
+
+            def reset(self, **kwargs):
+                return self.observation_space.sample(), {}
+
+            def step(self, action):
+                return self.observation_space.sample(), 1.0, False, False, {}
+
+        env = DummyPixelEnv()
+        env = GrayscaleWrapper(env)
         env = ResizeWrapper(env, size=64)
         env = NormalizeWrapper(env)
         env = FrameStackWrapper(env, n_frames=4)
         env = TransposeWrapper(env)
-        env_name = "CartPole-v1 (pixel)"
+        env_name = "DummyPixelEnv"
 
     obs, info = env.reset(seed=42)
     print(f"Env: {env_name}")

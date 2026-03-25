@@ -1,0 +1,15 @@
+env: "CartPole-v1"
+seed: 42
+latent_dim: 128
+hidden_dim: 128
+stoch_dim: 16
+kl_weight: 1.0
+horizon: 10
+gamma: 0.99
+lambda_: 0.95
+batch_size: 16
+batch_length: 20
+learning_rate: 6.0e-4
+mixed_precision: false
+prefill_steps: 500
+total_steps: 100_000

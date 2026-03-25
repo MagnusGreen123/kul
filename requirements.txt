@@ -1,0 +1,9 @@
+torch>=2.0
+gymnasium[atari]
+ale-py
+autorom
+einops
+wandb
+matplotlib
+numpy
+pyyaml

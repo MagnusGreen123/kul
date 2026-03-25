@@ -1,0 +1,7 @@
+checkpoints/
+runs/
+__pycache__/
+*.pyc
+.env
+wandb/
+*.png

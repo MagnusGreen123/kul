@@ -27,12 +27,13 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def collect_episode(env, actor, rssm, device, act_dim, random: bool = False):
-    """Collect one episode.
+def collect_episode(env, actor, encoder, rssm, device, act_dim, random: bool = False):
+    """Collect one episode using encoder + posterior for state tracking.
 
     Args:
         env: gymnasium environment (pixel-based, wrapped)
         actor: Actor network (unused if random=True)
+        encoder: ConvEncoder for embedding observations
         rssm: RSSM for maintaining state during collection
         device: torch device
         act_dim: action dimension
@@ -43,6 +44,7 @@ def collect_episode(env, actor, rssm, device, act_dim, random: bool = False):
     """
     obs, _ = env.reset()
     h, z = rssm.initial_state(1, device)
+    prev_action = torch.zeros(1, act_dim, device=device)
 
     obs_list, action_list, reward_list, done_list = [], [], [], []
 
@@ -50,15 +52,15 @@ def collect_episode(env, actor, rssm, device, act_dim, random: bool = False):
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
-            embed = None  # We don't observe during collection to keep it simple
-            # Use prior for state tracking (no encoder needed for action selection)
+            # Encode observation and update state via posterior
+            embed = encoder(obs_tensor)  # (1, embed_dim)
+            h, z, _, _ = rssm.observe_step(h, z, prev_action, embed)
+
             if random:
                 action_idx = env.action_space.sample()
                 action_onehot = np.zeros(act_dim, dtype=np.float32)
                 action_onehot[action_idx] = 1.0
             else:
-                # Encode current obs and update state
-                from models.encoder import ConvEncoder
                 action_onehot_t, _ = actor.get_action(h.squeeze(0), z.squeeze(0))
                 action_onehot = action_onehot_t.cpu().numpy()
                 action_idx = action_onehot.argmax()
@@ -71,11 +73,7 @@ def collect_episode(env, actor, rssm, device, act_dim, random: bool = False):
         reward_list.append(reward)
         done_list.append(float(done))
 
-        # Update RSSM state for next step (using prior only, no encoder)
-        with torch.no_grad():
-            action_t = torch.tensor(action_onehot, dtype=torch.float32, device=device).unsqueeze(0)
-            h, z, _ = rssm.imagine_step(h, z, action_t)
-
+        prev_action = torch.tensor(action_onehot, dtype=torch.float32, device=device).unsqueeze(0)
         obs = next_obs
         if done:
             break
@@ -151,7 +149,7 @@ def main():
     prefill_steps = 0
     while prefill_steps < cfg["prefill_steps"]:
         obs, actions, rewards, dones = collect_episode(
-            env, actor, wm.rssm, device, act_dim, random=True
+            env, actor, wm.encoder, wm.rssm, device, act_dim, random=True
         )
         buffer.add_episode(obs, actions, rewards, dones)
         prefill_steps += len(rewards)
@@ -165,7 +163,7 @@ def main():
     while global_step < total_steps:
         # Collect one episode
         obs, actions, rewards, dones = collect_episode(
-            env, actor, wm.rssm, device, act_dim, random=False
+            env, actor, wm.encoder, wm.rssm, device, act_dim, random=False
         )
         buffer.add_episode(obs, actions, rewards, dones)
         ep_reward = rewards.sum()
@@ -175,9 +173,9 @@ def main():
 
         logger.log_episode(ep_reward, ep_length, step=global_step)
 
-        # Train world model
-        if global_step % cfg.get("train_every", 5) == 0:
-            for _ in range(cfg.get("train_steps", 1)):
+        # Train world model — multiple gradient steps per episode
+        n_train_steps = max(1, ep_length // cfg.get("train_every", 5))
+        for _ in range(n_train_steps):
                 batch = buffer.sample(cfg["batch_size"], device)
 
                 # Ensure actions are one-hot

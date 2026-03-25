@@ -1,15 +1,38 @@
 env: "CartPole-v1"
+pixel_env: false       # CartPole uses vector obs, not pixels
 seed: 42
-latent_dim: 128
+
+# RSSM dimensions (smaller for simple env)
+embed_dim: 128
 hidden_dim: 128
 stoch_dim: 16
+act_dim: 2
+obs_channels: 4
+cnn_depth: 32
+
+# Training
 kl_weight: 1.0
+kl_balance: 0.8
+free_bits: 1.0
+use_symlog: true
 horizon: 10
 gamma: 0.99
 lambda_: 0.95
 batch_size: 16
 batch_length: 20
 learning_rate: 6.0e-4
+max_grad_norm: 100.0
 mixed_precision: false
+
+# Collection
 prefill_steps: 500
-total_steps: 100_000
+total_steps: 100000
+train_every: 5           # env steps between world model updates
+train_steps: 1            # world model gradient steps per update
+checkpoint_every: 10000
+log_every: 500
+eval_every: 5000
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: false

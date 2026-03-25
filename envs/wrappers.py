@@ -3,6 +3,7 @@ Gymnasium wrappers for Atari/pixel-based environments.
 Resize to 64x64, grayscale, frame-stack (4), normalize to [-0.5, 0.5].
 """
 
+import ale_py  # registers Atari envs with gymnasium
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces

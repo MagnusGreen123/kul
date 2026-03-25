@@ -143,17 +143,18 @@ class ActorCriticTrainer:
         self.critic_opt.step()
 
         # ── Actor loss ──
-        # Re-imagine to get fresh computation graph for actor
+        # Re-imagine with fresh graph; gradients flow through actor -> RSSM -> reward_pred
         h_imag2, z_imag2, actions2, rewards2, values2 = self.imagine_rollout(
             start_h.detach(), start_z.detach()
         )
         if self.use_symlog:
             rewards2 = symexp(rewards2)
 
-        with torch.no_grad():
-            lambda_returns2 = compute_lambda_returns(
-                rewards2, values2.detach(), self.gamma, self.lambda_
-            )
+        # Lambda-returns WITH gradient through rewards (actor can influence them)
+        # but values are detached (critic is a fixed baseline here)
+        lambda_returns2 = compute_lambda_returns(
+            rewards2, values2.detach(), self.gamma, self.lambda_
+        )
 
         # Actor maximizes lambda-returns (negate for gradient descent)
         actor_loss = -lambda_returns2.mean()

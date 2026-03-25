@@ -174,22 +174,26 @@ def kl_loss(priors, posteriors, free_bits: float = 1.0, balance: float = 0.8):
     Returns:
         scalar KL loss
     """
-    kl_values = []
+    kl_prior_grad = []   # gradient flows to prior only
+    kl_post_grad = []    # gradient flows to posterior only
+
     for prior, post in zip(priors, posteriors):
-        kl = kl_divergence(post, prior)  # (B, stoch_dim)
-        kl = torch.clamp(kl, min=free_bits)
-        kl_values.append(kl.sum(dim=-1))  # (B,)
+        # Detach by creating new distributions from detached params
+        prior_detached = Normal(prior.loc.detach(), prior.scale.detach())
+        post_detached = Normal(post.loc.detach(), post.scale.detach())
 
-    kl_tensor = torch.stack(kl_values, dim=1)  # (B, T)
+        # Train prior toward posterior (posterior is fixed target)
+        kl_to_prior = kl_divergence(post_detached, prior).clamp(min=free_bits).sum(-1)
+        # Train posterior toward prior (prior is fixed target)
+        kl_to_post = kl_divergence(post, prior_detached).clamp(min=free_bits).sum(-1)
 
-    # KL balancing: mostly train prior toward posterior
-    # balance=0.8 means 80% gradient to prior, 20% to posterior
-    kl_balanced = (
-        balance * kl_divergence(post.detach(), prior).clamp(min=free_bits).sum(-1).unsqueeze(1)
-        + (1 - balance) * kl_divergence(post, prior.detach()).clamp(min=free_bits).sum(-1).unsqueeze(1)
-    )
+        kl_prior_grad.append(kl_to_prior)
+        kl_post_grad.append(kl_to_post)
 
-    return kl_tensor.mean()
+    kl_prior = torch.stack(kl_prior_grad, dim=1).mean()  # (B, T) -> scalar
+    kl_post = torch.stack(kl_post_grad, dim=1).mean()
+
+    return balance * kl_prior + (1 - balance) * kl_post
 
 
 if __name__ == "__main__":

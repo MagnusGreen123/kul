@@ -42,7 +42,8 @@ class WorldModel(nn.Module):
         self.decoder = ConvDecoder(latent_dim=hidden_dim + stoch_dim, out_channels=obs_channels, depth=depth)
         self.rssm = RSSM(embed_dim=embed_dim, stoch_dim=stoch_dim,
                          hidden_dim=hidden_dim, act_dim=act_dim)
-        self.reward_pred = RewardPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_dim)
+        mlp_units = cfg.get("mlp_units", 256)
+        self.reward_pred = RewardPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_dim, units=mlp_units)
 
         self.kl_weight = cfg.get("kl_weight", 1.0)
         self.kl_balance = cfg.get("kl_balance", 0.8)

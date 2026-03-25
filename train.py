@@ -177,22 +177,36 @@ def main():
     print(f"Config: {args.config}")
     print(f"Env: {cfg['env']} x {n_envs} parallel")
     print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
 
     # ── Models ──
     wm = WorldModel(cfg).to(device)
+    mlp_units = cfg.get("mlp_units", 512)
     actor = Actor(
         hidden_dim=cfg["hidden_dim"],
         stoch_dim=cfg["stoch_dim"],
         act_dim=act_dim,
+        units=mlp_units,
         discrete=True,
     ).to(device)
     critic = Critic(
         hidden_dim=cfg["hidden_dim"],
         stoch_dim=cfg["stoch_dim"],
+        units=mlp_units,
     ).to(device)
 
     # Enable cudnn benchmark for faster convolutions
     torch.backends.cudnn.benchmark = True
+
+    total_params = sum(p.numel() for p in wm.parameters()) + \
+                   sum(p.numel() for p in actor.parameters()) + \
+                   sum(p.numel() for p in critic.parameters())
+    print(f"Total parameters: {total_params:,}")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        print(f"GPU memory after model load: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
     # ── Trainers ──
     wm_trainer = WorldModelTrainer(wm, cfg, device)
@@ -206,7 +220,7 @@ def main():
 
     # ── Replay buffer ──
     buffer = EpisodeReplayBuffer(
-        capacity=1000,
+        capacity=cfg.get("buffer_capacity", 1000),
         batch_length=cfg["batch_length"],
     )
 
@@ -330,4 +344,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback
+    try:
+        main()
+    except Exception as e:
+        print(f"\n{'='*60}")
+        print(f"FATAL ERROR: {e}")
+        print(f"{'='*60}")
+        traceback.print_exc()
+        import sys
+        sys.exit(1)

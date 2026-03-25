@@ -8,6 +8,37 @@ import numpy as np
 from gymnasium import spaces
 
 
+class MaxAndSkipWrapper(gym.Wrapper):
+    """Repeat action for `skip` frames, return max of last 2 frames.
+    Standard for NoFrameskip Atari envs."""
+
+    def __init__(self, env: gym.Env, skip: int = 4):
+        super().__init__(env)
+        self.skip = skip
+        self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
+
+    def step(self, action):
+        total_reward = 0.0
+        terminated = truncated = False
+        for i in range(self.skip):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            if i == self.skip - 2:
+                self._obs_buffer[0] = obs
+            if i == self.skip - 1:
+                self._obs_buffer[1] = obs
+            total_reward += reward
+            if terminated or truncated:
+                break
+        max_obs = self._obs_buffer.max(axis=0)
+        return max_obs, total_reward, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._obs_buffer[0] = obs
+        self._obs_buffer[1] = obs
+        return obs, info
+
+
 class GrayscaleWrapper(gym.ObservationWrapper):
     """Convert RGB observation to grayscale. Output shape: (H, W, 1)."""
 
@@ -125,10 +156,11 @@ def make_atari_env(env_name: str, size: int = 64, n_frames: int = 4,
                    seed: int = 42) -> gym.Env:
     """Create a fully wrapped Atari environment.
 
-    Pipeline: raw env -> grayscale -> resize -> normalize -> frame-stack -> transpose
+    Pipeline: raw env -> max-and-skip -> grayscale -> resize -> normalize -> frame-stack -> transpose
     Output obs shape: (n_frames, size, size)  dtype: float32, range [-0.5, 0.5]
     """
     env = gym.make(env_name)
+    env = MaxAndSkipWrapper(env, skip=4)
     env = GrayscaleWrapper(env)
     env = ResizeWrapper(env, size=size)
     env = NormalizeWrapper(env)
@@ -140,8 +172,8 @@ def make_atari_env(env_name: str, size: int = 64, n_frames: int = 4,
 if __name__ == "__main__":
     # Smoke test with a simple environment
     try:
-        env = make_atari_env("ALE/Pong-v5")
-        env_name = "ALE/Pong-v5"
+        env = make_atari_env("PongNoFrameskip-v4")
+        env_name = "PongNoFrameskip-v4"
     except Exception:
         # Fallback: generate random pixel obs to test the wrapper pipeline
         print("Atari not available, testing with dummy pixel obs")

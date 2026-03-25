@@ -1,4 +1,4 @@
-env: "ALE/Pong-v5"
+env: "PongNoFrameskip-v4"
 pixel_env: true
 seed: 42
 

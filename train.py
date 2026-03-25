@@ -134,6 +134,20 @@ class ParallelCollector:
 
         return completed, steps_collected
 
+    def flush_partial_episodes(self, min_length=50):
+        """Return any in-progress episodes that are long enough, then reset them."""
+        partial = []
+        for i in range(self.n_envs):
+            ep = self._episode_data[i]
+            if len(ep["obs"]) >= min_length:
+                partial.append((
+                    np.array(ep["obs"], dtype=np.float32),
+                    np.array(ep["act"], dtype=np.float32),
+                    np.array(ep["rew"], dtype=np.float32),
+                    np.array(ep["done"], dtype=np.float32),
+                ))
+        return partial
+
     def close(self):
         for env in self.envs:
             env.close()
@@ -215,10 +229,16 @@ def main():
     print(f"Prefilling {cfg['prefill_steps']} steps with random actions ({n_envs} envs)...")
     prefill_steps = 0
     while prefill_steps < cfg["prefill_steps"]:
-        episodes, steps = collector.collect_steps(cfg["prefill_steps"] - prefill_steps, random=True)
+        episodes, steps = collector.collect_steps(
+            min(cfg["prefill_steps"] - prefill_steps + 2000, cfg["prefill_steps"]),
+            random=True,
+        )
         for obs, actions, rewards, dones in episodes:
             buffer.add_episode(obs, actions, rewards, dones)
         prefill_steps += steps
+    # Also flush any in-progress episodes long enough to use
+    for obs, actions, rewards, dones in collector.flush_partial_episodes(cfg["batch_length"]):
+        buffer.add_episode(obs, actions, rewards, dones)
     collector._reset_all()
     print(f"Prefilled {prefill_steps} steps in {len(buffer)} episodes")
 

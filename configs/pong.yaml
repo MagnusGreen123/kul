@@ -27,7 +27,7 @@ mixed_precision: true
 # Parallel collection
 n_envs: 8                # parallel environments
 collect_per_step: 1000    # env steps per collect phase
-train_ratio: 0.5          # gradient steps per env step (500 train steps per 1000 env steps)
+train_ratio: 0.2          # gradient steps per env step (200 train steps per 1000 env steps)
 
 # Schedule
 prefill_steps: 10000      # ~10 Pong episodes to ensure buffer has data

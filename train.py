@@ -191,14 +191,8 @@ def main():
         stoch_dim=cfg["stoch_dim"],
     ).to(device)
 
-    # Compile models for speed (PyTorch 2.x)
-    if hasattr(torch, "compile") and device.type == "cuda":
-        try:
-            wm.encoder = torch.compile(wm.encoder)
-            wm.decoder = torch.compile(wm.decoder)
-            print("torch.compile enabled for encoder/decoder")
-        except Exception:
-            print("torch.compile not available, continuing without")
+    # Enable cudnn benchmark for faster convolutions
+    torch.backends.cudnn.benchmark = True
 
     # ── Trainers ──
     wm_trainer = WorldModelTrainer(wm, cfg, device)

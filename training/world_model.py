@@ -118,7 +118,7 @@ class WorldModelTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, eps=1e-5)
         self.scaler = GradScaler("cuda", enabled=self.use_amp)
 
-    def train_step(self, batch: dict) -> dict:
+    def train_step(self, batch: dict) -> tuple[dict, dict]:
         """Single training step.
 
         Args:
@@ -126,7 +126,8 @@ class WorldModelTrainer:
                    reward (B,T), done (B,T)
 
         Returns:
-            dict of scalar loss values
+            (losses_dict, info_dict) — info contains detached h_seq, z_seq
+            for actor-critic training without a redundant forward pass.
         """
         obs = batch["obs"].to(self.device)
         actions = batch["action"].to(self.device)
@@ -143,7 +144,10 @@ class WorldModelTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        return {k: v.item() for k, v in losses.items()}
+        # Ensure float32 for downstream actor-critic (AMP may produce float16)
+        info = {k: v.float() if v.is_floating_point() else v for k, v in info.items()}
+
+        return {k: v.item() for k, v in losses.items()}, info
 
 
 if __name__ == "__main__":

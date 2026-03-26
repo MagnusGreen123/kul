@@ -220,7 +220,7 @@ def main():
 
     # ── Replay buffer ──
     buffer = EpisodeReplayBuffer(
-        capacity=cfg.get("buffer_capacity", 1000),
+        max_total_steps=cfg.get("buffer_max_steps", 2_000_000),
         batch_length=cfg["batch_length"],
     )
 
@@ -276,17 +276,10 @@ def main():
         for _ in range(n_train):
             batch = prefetcher.get()
 
-            wm_losses = wm_trainer.train_step(batch)
+            # train_step now returns detached states, no redundant forward pass
+            wm_losses, wm_info = wm_trainer.train_step(batch)
 
-            # Get states for actor-critic
-            with torch.no_grad():
-                _, info = wm(
-                    batch["obs"].to(device),
-                    batch["action"].to(device),
-                    batch["reward"].to(device),
-                )
-
-            ac_losses = ac_trainer.train_step(info["h_seq"], info["z_seq"])
+            ac_losses = ac_trainer.train_step(wm_info["h_seq"], wm_info["z_seq"])
 
             all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
                           **{f"ac/{k}": v for k, v in ac_losses.items()}}
@@ -322,22 +315,23 @@ def main():
         # ── Visualization ──
         if global_step % cfg.get("eval_every", 10000) < collect_per_step + 1000:
             try:
-                batch = buffer.sample(1, device)
-                batch["action"] = make_batch_actions_onehot(batch["action"], act_dim)
+                vis_batch = buffer.sample(1, device)
+                vis_batch["action"] = make_batch_actions_onehot(vis_batch["action"], act_dim)
                 with torch.no_grad():
-                    _, info = wm(
-                        batch["obs"].to(device),
-                        batch["action"].to(device),
-                        batch["reward"].to(device),
+                    _, vis_info = wm(
+                        vis_batch["obs"],
+                        vis_batch["action"],
+                        vis_batch["reward"],
                     )
                 save_reconstruction_grid(
-                    batch["obs"].to(device), info["recon"],
+                    vis_batch["obs"], vis_info["recon"],
                     str(runs_dir / f"recon_step{global_step}.png"),
                 )
                 save_imagination_gif(
-                    wm.decoder, info["h_seq"], info["z_seq"],
+                    wm.decoder, vis_info["h_seq"], vis_info["z_seq"],
                     str(runs_dir / f"imagine_step{global_step}.gif"),
                 )
+                del vis_batch, vis_info
             except Exception as e:
                 print(f"Visualization failed: {e}")
 

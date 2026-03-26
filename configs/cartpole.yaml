@@ -33,6 +33,9 @@ checkpoint_every: 10000
 log_every: 500
 eval_every: 5000
 
+# Buffer
+buffer_max_steps: 100000
+
 # Wandb
 wandb_project: "dreamer"
 use_wandb: false

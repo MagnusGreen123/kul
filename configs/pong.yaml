@@ -37,8 +37,9 @@ checkpoint_every: 50000
 log_every: 4000
 eval_every: 50000
 
-# Buffer
-buffer_capacity: 50000
+# Buffer — capped by total transitions, not episode count.
+# 2M steps * ~16 KB/step (uint8 obs) ≈ 32 GB RAM, safe for 96 GB machine.
+buffer_max_steps: 2000000
 
 # Wandb
 wandb_project: "dreamer"

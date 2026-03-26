@@ -105,6 +105,10 @@ class ActorCriticTrainer:
     def train_step(self, h_seq, z_seq):
         """Train actor and critic from world model states.
 
+        Uses a single imagination rollout (not two). Freezes world model
+        parameters during imagination so only actor gradients are computed,
+        saving ~50% GPU memory.
+
         Args:
             h_seq: (B, T, hidden_dim) from world model observe pass
             z_seq: (B, T, stoch_dim) from world model observe pass
@@ -116,53 +120,48 @@ class ActorCriticTrainer:
 
         # Pick random starting states from the observed sequence
         t_indices = torch.randint(0, T, (B,), device=self.device)
-        start_h = h_seq[torch.arange(B), t_indices]  # (B, hidden_dim)
-        start_z = z_seq[torch.arange(B), t_indices]  # (B, stoch_dim)
+        start_h = h_seq[torch.arange(B), t_indices].detach()
+        start_z = z_seq[torch.arange(B), t_indices].detach()
 
-        # Imagine forward
+        # Freeze world model: gradients still flow to actor via inputs
+        # (straight-through), but RSSM/reward_pred params don't accumulate grads
+        for p in self.world_model.parameters():
+            p.requires_grad_(False)
+
+        # Single imagination rollout
         h_imag, z_imag, actions, rewards, values = self.imagine_rollout(
-            start_h.detach(), start_z.detach()
+            start_h, start_z
         )
 
-        # Undo symlog on rewards if needed
         if self.use_symlog:
             rewards = symexp(rewards)
 
-        # Lambda-returns (detached for critic target)
-        with torch.no_grad():
-            lambda_returns = compute_lambda_returns(
-                rewards, values.detach(), self.gamma, self.lambda_
-            )
-
-        # ── Critic loss ──
-        critic_loss = F.mse_loss(values, lambda_returns.detach())
-
-        self.critic_opt.zero_grad()
-        critic_loss.backward(retain_graph=True)
-        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-        self.critic_opt.step()
-
-        # ── Actor loss ──
-        # Re-imagine with fresh graph; gradients flow through actor -> RSSM -> reward_pred
-        h_imag2, z_imag2, actions2, rewards2, values2 = self.imagine_rollout(
-            start_h.detach(), start_z.detach()
-        )
-        if self.use_symlog:
-            rewards2 = symexp(rewards2)
-
-        # Lambda-returns WITH gradient through rewards (actor can influence them)
-        # but values are detached (critic is a fixed baseline here)
-        lambda_returns2 = compute_lambda_returns(
-            rewards2, values2.detach(), self.gamma, self.lambda_
+        # Lambda-returns with gradient through rewards (actor influences them)
+        # Values detached so critic serves as a fixed baseline
+        lambda_returns = compute_lambda_returns(
+            rewards, values.detach(), self.gamma, self.lambda_
         )
 
-        # Actor maximizes lambda-returns (negate for gradient descent)
-        actor_loss = -lambda_returns2.mean()
+        # ── Actor loss ── (maximise lambda-returns)
+        actor_loss = -lambda_returns.mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
         nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_opt.step()
+
+        # Unfreeze world model for its own training
+        for p in self.world_model.parameters():
+            p.requires_grad_(True)
+
+        # ── Critic loss ── (detached states, no imagination graph needed)
+        critic_values = self.critic(h_imag.detach(), z_imag.detach())
+        critic_loss = F.mse_loss(critic_values, lambda_returns.detach())
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        self.critic_opt.step()
 
         return {
             "actor_loss": actor_loss.item(),

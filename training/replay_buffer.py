@@ -1,33 +1,39 @@
 """
 Sequence replay buffer for Dreamer-style training.
 Stores episodes and samples sequential chunks of length `batch_length`.
+Observations are stored as uint8 to save ~4x memory.
 """
+
+import collections
 
 import numpy as np
 import torch
 
 
 class EpisodeReplayBuffer:
-    """Ring buffer of episodes. Samples contiguous sequences for world model training.
+    """Ring buffer of episodes capped by total transition count.
+
+    Observations are compressed to uint8 [0, 255] on insert and
+    converted back to float32 [-0.5, 0.5] during sampling (~4x RAM savings).
 
     Each episode is stored as a dict of numpy arrays:
-        obs:    (T, *obs_shape)
-        action: (T,) or (T, act_dim)
-        reward: (T,)
-        done:   (T,)
+        obs:    (T, *obs_shape) uint8
+        action: (T,) or (T, act_dim) float32
+        reward: (T,) float32
+        done:   (T,) float32
 
     Sampling returns batches of shape (B, L, ...) where L = batch_length.
     """
 
-    def __init__(self, capacity: int, batch_length: int):
+    def __init__(self, max_total_steps: int, batch_length: int):
         """
         Args:
-            capacity: max number of episodes to store
+            max_total_steps: max total transitions across all episodes
             batch_length: length of sampled sequences
         """
-        self.capacity = capacity
+        self.max_total_steps = max_total_steps
         self.batch_length = batch_length
-        self.episodes: list[dict[str, np.ndarray]] = []
+        self.episodes: collections.deque[dict[str, np.ndarray]] = collections.deque()
         self._total_steps = 0
 
     @property
@@ -42,7 +48,7 @@ class EpisodeReplayBuffer:
         """Add a complete episode.
 
         Args:
-            obs:     (T, *obs_shape)
+            obs:     (T, *obs_shape) — float32 [-0.5, 0.5] or uint8 [0, 255]
             actions: (T,) or (T, act_dim)
             rewards: (T,)
             dones:   (T,)
@@ -52,19 +58,25 @@ class EpisodeReplayBuffer:
         assert len(actions) == ep_len
         assert len(dones) == ep_len
 
+        # Compress float32 obs to uint8 for storage
+        if obs.dtype in (np.float32, np.float64):
+            obs_store = np.clip((obs + 0.5) * 255, 0, 255).astype(np.uint8)
+        else:
+            obs_store = np.asarray(obs, dtype=np.uint8)
+
         episode = {
-            "obs": np.asarray(obs, dtype=np.float32),
-            "action": np.asarray(actions),
+            "obs": obs_store,
+            "action": np.asarray(actions, dtype=np.float32),
             "reward": np.asarray(rewards, dtype=np.float32),
             "done": np.asarray(dones, dtype=np.float32),
         }
         self._total_steps += ep_len
-
-        if len(self.episodes) >= self.capacity:
-            removed = self.episodes.pop(0)
-            self._total_steps -= len(removed["reward"])
-
         self.episodes.append(episode)
+
+        # Evict oldest episodes until under step budget
+        while self._total_steps > self.max_total_steps and len(self.episodes) > 1:
+            removed = self.episodes.popleft()
+            self._total_steps -= len(removed["reward"])
 
     def sample(self, batch_size: int, device: torch.device = torch.device("cpu")
                ) -> dict[str, torch.Tensor]:
@@ -73,7 +85,6 @@ class EpisodeReplayBuffer:
         Returns dict with tensors of shape (B, L, ...).
         Episodes shorter than batch_length are skipped.
         """
-        # Filter episodes long enough to sample from
         valid = [ep for ep in self.episodes if len(ep["reward"]) >= self.batch_length]
         if not valid:
             raise ValueError(
@@ -82,7 +93,7 @@ class EpisodeReplayBuffer:
                 f"longest: {max(len(e['reward']) for e in self.episodes) if self.episodes else 0}"
             )
 
-        batch = {k: [] for k in ("obs", "action", "reward", "done")}
+        obs_list, act_list, rew_list, done_list = [], [], [], []
         rng = np.random.default_rng()
 
         for _ in range(batch_size):
@@ -91,15 +102,26 @@ class EpisodeReplayBuffer:
             start = rng.integers(max_start + 1)
             end = start + self.batch_length
 
-            for key in batch:
-                batch[key].append(ep[key][start:end])
+            obs_list.append(ep["obs"][start:end])
+            act_list.append(ep["action"][start:end])
+            rew_list.append(ep["reward"][start:end])
+            done_list.append(ep["done"][start:end])
 
-        return {
-            k: torch.tensor(np.stack(v), device=device, pin_memory=(device.type == "cuda"))
-            if device.type != "cuda"
-            else torch.tensor(np.stack(v)).pin_memory().to(device, non_blocking=True)
-            for k, v in batch.items()
-        }
+        # Decompress uint8 obs to float32 [-0.5, 0.5]
+        obs_np = np.stack(obs_list).astype(np.float32) / 255.0 - 0.5
+
+        if device.type == "cuda":
+            obs_t = torch.from_numpy(obs_np).pin_memory().to(device, non_blocking=True)
+            act_t = torch.from_numpy(np.stack(act_list)).pin_memory().to(device, non_blocking=True)
+            rew_t = torch.from_numpy(np.stack(rew_list)).pin_memory().to(device, non_blocking=True)
+            done_t = torch.from_numpy(np.stack(done_list)).pin_memory().to(device, non_blocking=True)
+        else:
+            obs_t = torch.from_numpy(obs_np)
+            act_t = torch.from_numpy(np.stack(act_list).copy())
+            rew_t = torch.from_numpy(np.stack(rew_list).copy())
+            done_t = torch.from_numpy(np.stack(done_list).copy())
+
+        return {"obs": obs_t, "action": act_t, "reward": rew_t, "done": done_t}
 
 
 class AsyncBatchPrefetcher:
@@ -115,14 +137,15 @@ class AsyncBatchPrefetcher:
 
     def __init__(self, buffer: EpisodeReplayBuffer, batch_size: int,
                  act_dim: int, device: torch.device):
-        import threading
         import queue
+        import threading
         self.buffer = buffer
         self.batch_size = batch_size
         self.act_dim = act_dim
         self.device = device
         self.queue = queue.Queue(maxsize=2)
         self._stop = threading.Event()
+        self._error = None
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
@@ -138,30 +161,42 @@ class AsyncBatchPrefetcher:
                 batch = self.buffer.sample(self.batch_size, self.device)
                 batch["action"] = self._make_onehot(batch["action"])
                 self.queue.put(batch, timeout=1.0)
-            except Exception:
+            except Exception as e:
                 if self._stop.is_set():
                     break
+                # Store error so main thread can see it
+                self._error = e
 
     def get(self):
-        return self.queue.get()
+        if self._error is not None:
+            err = self._error
+            self._error = None
+            raise RuntimeError(f"Prefetcher worker failed: {err}") from err
+        return self.queue.get(timeout=30.0)
 
     def stop(self):
         self._stop.set()
+        # Drain queue so worker can exit if blocked on put
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except Exception:
+                break
         self._thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":
     # Quick smoke test
-    buf = EpisodeReplayBuffer(capacity=100, batch_length=10)
+    buf = EpisodeReplayBuffer(max_total_steps=10000, batch_length=10)
 
     # Add some fake episodes
     for ep_i in range(5):
         T = np.random.randint(15, 50)
         buf.add_episode(
-            obs=np.random.randn(T, 4),
+            obs=np.random.randn(T, 4).astype(np.float32),
             actions=np.random.randint(0, 2, size=(T,)),
-            rewards=np.random.randn(T),
-            dones=np.zeros(T),
+            rewards=np.random.randn(T).astype(np.float32),
+            dones=np.zeros(T, dtype=np.float32),
         )
 
     batch = buf.sample(batch_size=8)

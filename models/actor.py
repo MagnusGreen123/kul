@@ -49,7 +49,9 @@ class Actor(nn.Module):
     def get_action(self, h: torch.Tensor, z: torch.Tensor):
         """Sample action and return (action, log_prob).
 
-        For discrete: returns one-hot action tensor for RSSM input.
+        For discrete: uses straight-through gradients so that the forward
+        pass sees a hard one-hot but gradients flow through the softmax
+        probabilities back to the actor parameters.
         """
         dist = self.forward(h, z)
 
@@ -60,7 +62,11 @@ class Actor(nn.Module):
             action_onehot = torch.zeros(*action_idx.shape, self.act_dim,
                                         device=h.device)
             action_onehot.scatter_(-1, action_idx.unsqueeze(-1), 1.0)
-            return action_onehot, log_prob
+            # Straight-through: forward value = one-hot (probs cancel),
+            # backward gradient flows through probs -> logits -> actor
+            probs = dist.probs
+            action_st = action_onehot + probs - probs.detach()
+            return action_st, log_prob
         else:
             action = dist.rsample()
             log_prob = dist.log_prob(action).sum(-1)

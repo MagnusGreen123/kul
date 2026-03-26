@@ -16,7 +16,7 @@ from models.actor import Actor
 from models.critic import Critic
 from training.world_model import WorldModel, WorldModelTrainer
 from training.actor_critic import ActorCriticTrainer
-from training.replay_buffer import EpisodeReplayBuffer
+from training.replay_buffer import EpisodeReplayBuffer, AsyncBatchPrefetcher
 from utils.logging import Logger
 from utils.visualization import save_reconstruction_grid, save_imagination_gif
 
@@ -269,11 +269,12 @@ def main():
             episode_count += 1
             logger.log_episode(rewards.sum(), len(rewards), step=global_step)
 
-        # ── Train phase ──
+        # ── Train phase with async prefetch ──
         n_train = max(1, int(steps * train_ratio))
+        prefetcher = AsyncBatchPrefetcher(buffer, cfg["batch_size"], act_dim, device)
+
         for _ in range(n_train):
-            batch = buffer.sample(cfg["batch_size"], device)
-            batch["action"] = make_batch_actions_onehot(batch["action"], act_dim)
+            batch = prefetcher.get()
 
             wm_losses = wm_trainer.train_step(batch)
 
@@ -290,6 +291,8 @@ def main():
             all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
                           **{f"ac/{k}": v for k, v in ac_losses.items()}}
             logger.log_step(all_losses, step=global_step)
+
+        prefetcher.stop()
 
         # ── Log ──
         if ep_rewards:

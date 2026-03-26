@@ -95,9 +95,59 @@ class EpisodeReplayBuffer:
                 batch[key].append(ep[key][start:end])
 
         return {
-            k: torch.tensor(np.stack(v), device=device)
+            k: torch.tensor(np.stack(v), device=device, pin_memory=(device.type == "cuda"))
+            if device.type != "cuda"
+            else torch.tensor(np.stack(v)).pin_memory().to(device, non_blocking=True)
             for k, v in batch.items()
         }
+
+
+class AsyncBatchPrefetcher:
+    """Prefetches the next batch on a background thread while GPU trains.
+
+    Usage:
+        prefetcher = AsyncBatchPrefetcher(buffer, batch_size, device)
+        for _ in range(n_train_steps):
+            batch = prefetcher.get()   # returns pre-loaded batch
+            # ... train on batch ...
+        prefetcher.stop()
+    """
+
+    def __init__(self, buffer: EpisodeReplayBuffer, batch_size: int,
+                 act_dim: int, device: torch.device):
+        import threading
+        import queue
+        self.buffer = buffer
+        self.batch_size = batch_size
+        self.act_dim = act_dim
+        self.device = device
+        self.queue = queue.Queue(maxsize=2)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _make_onehot(self, actions):
+        """Convert integer actions to one-hot if needed."""
+        if actions.dim() == 2:
+            return torch.nn.functional.one_hot(actions.long(), self.act_dim).float()
+        return actions
+
+    def _worker(self):
+        while not self._stop.is_set():
+            try:
+                batch = self.buffer.sample(self.batch_size, self.device)
+                batch["action"] = self._make_onehot(batch["action"])
+                self.queue.put(batch, timeout=1.0)
+            except Exception:
+                if self._stop.is_set():
+                    break
+
+    def get(self):
+        return self.queue.get()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":

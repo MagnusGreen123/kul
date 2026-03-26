@@ -19,7 +19,7 @@ use_symlog: true
 horizon: 15
 gamma: 0.99
 lambda_: 0.95
-batch_size: 128           # big batch for GPU saturation
+batch_size: 512           # maximize GPU saturation on V100 32GB
 batch_length: 30          # shorter sequences = faster RSSM loop
 learning_rate: 1.0e-4     # lower LR for stability with large model
 max_grad_norm: 10.0       # tighter clipping to prevent NaN

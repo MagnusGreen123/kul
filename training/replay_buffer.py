@@ -137,13 +137,14 @@ class AsyncBatchPrefetcher:
 
     def __init__(self, buffer: EpisodeReplayBuffer, batch_size: int,
                  act_dim: int, device: torch.device):
-        import queue
+        import queue as queue_mod
         import threading
+        self._queue_mod = queue_mod
         self.buffer = buffer
         self.batch_size = batch_size
         self.act_dim = act_dim
         self.device = device
-        self.queue = queue.Queue(maxsize=2)
+        self.queue = queue_mod.Queue(maxsize=2)
         self._stop = threading.Event()
         self._error = None
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -161,10 +162,11 @@ class AsyncBatchPrefetcher:
                 batch = self.buffer.sample(self.batch_size, self.device)
                 batch["action"] = self._make_onehot(batch["action"])
                 self.queue.put(batch, timeout=1.0)
+            except self._queue_mod.Full:
+                continue  # Queue full, just retry
             except Exception as e:
                 if self._stop.is_set():
                     break
-                # Store error so main thread can see it
                 self._error = e
 
     def get(self):

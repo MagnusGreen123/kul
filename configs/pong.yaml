@@ -38,7 +38,7 @@ log_every: 2000
 eval_every: 50000
 
 # Buffer
-buffer_capacity: 5000
+buffer_capacity: 50000    # ~50k episodes, uses ~40-50GB RAM
 
 # Wandb
 wandb_project: "dreamer"

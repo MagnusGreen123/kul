@@ -19,7 +19,7 @@ use_symlog: true
 horizon: 15
 gamma: 0.99
 lambda_: 0.95
-batch_size: 512           # keep high for GPU saturation
+batch_size: 1024          # max GPU saturation with smaller model
 batch_length: 30
 learning_rate: 1.0e-4
 max_grad_norm: 10.0

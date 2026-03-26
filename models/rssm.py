@@ -55,8 +55,11 @@ class RSSM(nn.Module):
         )
 
     def _stats(self, raw: torch.Tensor):
-        """Split raw params into mean and std."""
+        """Split raw params into mean and std, with NaN protection."""
         mean, log_std = raw.chunk(2, dim=-1)
+        # Clamp to prevent NaN from exploding values
+        mean = torch.clamp(mean, -20.0, 20.0)
+        log_std = torch.clamp(log_std, -10.0, 2.0)
         std = F.softplus(log_std) + 0.1  # min std for stability
         return mean, std
 

@@ -2,16 +2,16 @@ env: "PongNoFrameskip-v4"
 pixel_env: true
 seed: 42
 
-# RSSM dimensions — larger to utilize V100
+# RSSM dimensions — sized for V100 32GB
 embed_dim: 1024
 hidden_dim: 512
 stoch_dim: 64
-act_dim: 6              # Pong has 6 actions
-obs_channels: 4         # 4 stacked grayscale frames
-cnn_depth: 64           # deeper CNN (was 32)
-mlp_units: 512          # MLP hidden size for actor/critic/reward
+act_dim: 6
+obs_channels: 4
+cnn_depth: 64
+mlp_units: 512
 
-# Training — large batches for V100 32GB
+# Training — large batches, shorter sequences for speed
 kl_weight: 1.0
 kl_balance: 0.8
 free_bits: 1.0
@@ -19,16 +19,16 @@ use_symlog: true
 horizon: 15
 gamma: 0.99
 lambda_: 0.95
-batch_size: 64            # was 16 — fills GPU memory better
-batch_length: 50
-learning_rate: 3.0e-4
-max_grad_norm: 100.0
+batch_size: 128           # big batch for GPU saturation
+batch_length: 30          # shorter sequences = faster RSSM loop
+learning_rate: 1.0e-4     # lower LR for stability with large model
+max_grad_norm: 10.0       # tighter clipping to prevent NaN
 mixed_precision: true
 
-# Parallel collection — more envs for throughput
-n_envs: 16               # was 8
-collect_per_step: 2000    # was 1000
-train_ratio: 0.5          # 1000 gradient steps per 2000 env steps
+# Parallel collection
+n_envs: 16
+collect_per_step: 2000
+train_ratio: 0.15         # 300 gradient steps per 2000 env steps
 
 # Schedule
 prefill_steps: 10000
@@ -37,8 +37,8 @@ checkpoint_every: 50000
 log_every: 2000
 eval_every: 50000
 
-# Buffer — use the massive RAM
-buffer_capacity: 5000     # was 1000
+# Buffer
+buffer_capacity: 5000
 
 # Wandb
 wandb_project: "dreamer"

@@ -587,7 +587,7 @@ def main():
     print(f"  Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        total_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  VRAM: {total_gb:.1f} GB")
     print(f"  total_steps: {cfg['total_steps']:,}")
     print(f"  batch_size: {cfg['batch_size']}, batch_length: {cfg['batch_length']}")

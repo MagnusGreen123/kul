@@ -19,16 +19,16 @@ use_symlog: true
 horizon: 15
 gamma: 0.99
 lambda_: 0.95
-batch_size: 256           # safe margin, ~60% VRAM, won't OOM
+batch_size: 512           # uint8 fix freed ~50% VRAM, 512 fits in ~26/32 GB
 batch_length: 30
 learning_rate: 1.0e-4
 max_grad_norm: 10.0
 mixed_precision: true
 
 # Parallel collection
-n_envs: 16
+n_envs: 24                # CPU was at 8%, more envs = faster collect
 collect_per_step: 4000    # more env steps per round = fewer rounds
-train_ratio: 0.1          # 400 gradient steps per 4000 env steps
+train_ratio: 0.3          # 1200 gradient steps per 4000 env steps, GPU was 51% idle
 
 # Schedule
 prefill_steps: 10000

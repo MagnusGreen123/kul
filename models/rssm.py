@@ -123,12 +123,18 @@ class RSSM(nn.Module):
         else:
             h, z = initial_state
 
+        # Shift actions: at t=0 prev_action is zero (no action led to the
+        # first observation), at t>0 prev_action is actions[:, t-1].
+        # This matches the collector which correctly uses prev_actions.
+        zero_action = torch.zeros_like(actions[:, :1])
+        prev_actions = torch.cat([zero_action, actions[:, :-1]], dim=1)
+
         h_list, z_list = [], []
         priors, posteriors = [], []
 
         for t in range(T):
             h, z, prior, posterior = self.observe_step(
-                h, z, actions[:, t], obs_embeds[:, t]
+                h, z, prev_actions[:, t], obs_embeds[:, t]
             )
             h_list.append(h)
             z_list.append(z)
@@ -171,7 +177,7 @@ def kl_loss(priors, posteriors, free_bits: float = 1.0, balance: float = 0.8):
     Args:
         priors:     list of T Normal distributions
         posteriors: list of T Normal distributions
-        free_bits:  minimum KL per dimension
+        free_bits:  minimum total KL (summed over dimensions)
         balance:    weight on posterior (0.8 = mostly train prior toward posterior)
 
     Returns:
@@ -186,9 +192,11 @@ def kl_loss(priors, posteriors, free_bits: float = 1.0, balance: float = 0.8):
         post_detached = Normal(post.loc.detach(), post.scale.detach())
 
         # Train prior toward posterior (posterior is fixed target)
-        kl_to_prior = kl_divergence(post_detached, prior).clamp(min=free_bits).sum(-1)
+        # Clamp on the sum (not per-dim) — per-dim clamping creates a floor
+        # of free_bits*stoch_dim which kills all KL gradients.
+        kl_to_prior = kl_divergence(post_detached, prior).sum(-1).clamp(min=free_bits)
         # Train posterior toward prior (prior is fixed target)
-        kl_to_post = kl_divergence(post, prior_detached).clamp(min=free_bits).sum(-1)
+        kl_to_post = kl_divergence(post, prior_detached).sum(-1).clamp(min=free_bits)
 
         kl_prior_grad.append(kl_to_prior)
         kl_post_grad.append(kl_to_post)

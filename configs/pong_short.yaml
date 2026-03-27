@@ -12,12 +12,9 @@ cnn_depth: 48
 mlp_units: 400
 
 # Training
-kl_weight: 0.5            # was 1.0 — KL was stuck at free_bits ceiling (32.0),
-                           # dominating total loss. Lower weight lets recon/reward
-                           # gradients actually influence learning.
+kl_weight: 1.0
 kl_balance: 0.8
-free_bits: 0.5             # was 1.0 — floor of 1.0*32dims=32 was too high,
-                           # stochastic latent wasn't being used at all.
+free_bits: 1.0             # now clamped on sum (floor=1.0), not per-dim (was 32.0)
 use_symlog: true
 horizon: 15
 gamma: 0.99
@@ -46,4 +43,4 @@ buffer_max_steps: 500000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "short-test-v1"
+run_name: "short-test-v2-bugfix"

@@ -3,7 +3,7 @@ Actor-critic training via imagination rollouts through the world model.
 - Imagines H=15 steps using learned RSSM dynamics
 - Computes lambda-returns (lambda=0.95) with proper bootstrap
 - Uses target critic (EMA / Polyak) for stable value targets
-- Trains actor with backprop through rollout + entropy regularization
+- Trains actor with REINFORCE (log_prob * advantage) + entropy regularization
 - Trains critic with MSE on lambda-return targets from target critic
 """
 
@@ -112,50 +112,53 @@ class ActorCriticTrainer:
 
         Uses target_critic for value estimates (stable targets),
         and cont_pred for continuation probabilities (done masking).
+        No gradients flow through RSSM dynamics — actor uses REINFORCE.
 
         Returns:
             h_seq:          (B, H, hidden_dim)
             z_seq:          (B, H, stoch_dim)
-            actions:        (B, H, act_dim)
             rewards:        (B, H)
             values:         (B, H)  — from target_critic (no grad)
+            log_probs:      (B, H)  — log P(action) under actor (has grad)
             entropies:      (B, H)
             continuations:  (B, H)  — P(continue) from cont_pred (no grad)
             bootstrap:      (B,) — target_critic value for state beyond horizon
         """
         h, z = initial_h, initial_z
-        h_list, z_list, action_list = [], [], []
-        reward_list, value_list, entropy_list, cont_list = [], [], [], []
+        h_list, z_list = [], []
+        reward_list, value_list = [], []
+        log_prob_list, entropy_list, cont_list = [], [], []
 
         for _ in range(self.horizon):
-            action, _, entropy = self.actor.get_action(h, z)
-            h, z, _ = self.world_model.rssm.imagine_step(h, z, action)
-
-            reward = self.world_model.reward_pred(h, z)
+            action, log_prob, entropy = self.actor.get_action(h, z)
+            # Detach action before feeding to RSSM — REINFORCE doesn't
+            # need gradients through dynamics, only through log_prob
             with torch.no_grad():
+                h, z, _ = self.world_model.rssm.imagine_step(h, z, action.detach())
+                reward = self.world_model.reward_pred(h, z)
                 value = self.target_critic(h, z)
                 cont = torch.sigmoid(self.world_model.cont_pred(h, z))
 
             h_list.append(h)
             z_list.append(z)
-            action_list.append(action)
             reward_list.append(reward)
             value_list.append(value)
+            log_prob_list.append(log_prob)
             entropy_list.append(entropy)
             cont_list.append(cont)
 
         # Bootstrap: value of state one step beyond horizon (target critic)
-        boot_action, _, _ = self.actor.get_action(h, z)
-        h_boot, z_boot, _ = self.world_model.rssm.imagine_step(h, z, boot_action)
         with torch.no_grad():
+            boot_action, _, _ = self.actor.get_action(h, z)
+            h_boot, z_boot, _ = self.world_model.rssm.imagine_step(h, z, boot_action)
             bootstrap = self.target_critic(h_boot, z_boot)
 
         return (
             torch.stack(h_list, dim=1),
             torch.stack(z_list, dim=1),
-            torch.stack(action_list, dim=1),
             torch.stack(reward_list, dim=1),
             torch.stack(value_list, dim=1),
+            torch.stack(log_prob_list, dim=1),
             torch.stack(entropy_list, dim=1),
             torch.stack(cont_list, dim=1),
             bootstrap,
@@ -191,13 +194,8 @@ class ActorCriticTrainer:
         start_h = h_seq[torch.arange(B), t_indices].detach()
         start_z = z_seq[torch.arange(B), t_indices].detach()
 
-        # Freeze world model: gradients still flow to actor via inputs
-        # (straight-through), but RSSM/reward_pred params don't accumulate grads
-        for p in self.world_model.parameters():
-            p.requires_grad_(False)
-
-        # Single imagination rollout (values/bootstrap from target_critic)
-        h_imag, z_imag, actions, rewards, values, entropies, conts, bootstrap = \
+        # Imagination rollout — RSSM runs in no_grad, only actor log_probs have grad
+        h_imag, z_imag, rewards, values, log_probs, entropies, conts, bootstrap = \
             self.imagine_rollout(start_h, start_z)
 
         if self.use_symlog:
@@ -210,19 +208,18 @@ class ActorCriticTrainer:
             self.gamma, self.lambda_, continuations=conts
         )
 
-        # ── Actor loss ── (maximise normalized returns + entropy bonus)
-        # Normalization puts returns in ~[0,1], making entropy_coeff meaningful
-        normed_returns = self._normalize_returns(lambda_returns)
-        actor_loss = -(normed_returns.mean() + self.entropy_coeff * entropies.mean())
+        # ── Actor loss ── REINFORCE: log_prob weighted by normalized advantage
+        # Advantage = how much better than expected (baseline = values)
+        advantage = (lambda_returns - values).detach()
+        # Normalize advantage for stable gradients
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        # REINFORCE: gradient flows through log_probs directly to actor
+        actor_loss = -(advantage * log_probs).mean() - self.entropy_coeff * entropies.mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
         actor_grad = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_opt.step()
-
-        # Unfreeze world model for its own training
-        for p in self.world_model.parameters():
-            p.requires_grad_(True)
 
         # ── Critic loss ── targets from target_critic, train live critic
         critic_values = self.critic(h_imag.detach(), z_imag.detach())

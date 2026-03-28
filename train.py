@@ -328,7 +328,7 @@ def main():
                     str(runs_dir / f"recon_step{global_step}.png"),
                 )
                 save_imagination_gif(
-                    wm.decoder, vis_info["h_seq"], vis_info["z_seq"],
+                    lambda h, z: wm.decode(h, z), vis_info["h_seq"], vis_info["z_seq"],
                     str(runs_dir / f"imagine_step{global_step}.gif"),
                 )
                 del vis_batch, vis_info

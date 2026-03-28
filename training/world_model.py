@@ -39,16 +39,29 @@ class WorldModel(nn.Module):
         depth = cfg.get("cnn_depth", 32)
 
         self.encoder = ConvEncoder(in_channels=obs_channels, latent_dim=embed_dim, depth=depth)
-        self.decoder = ConvDecoder(latent_dim=hidden_dim + stoch_dim, out_channels=obs_channels, depth=depth)
         self.rssm = RSSM(embed_dim=embed_dim, stoch_dim=stoch_dim,
                          hidden_dim=hidden_dim, act_dim=act_dim)
         mlp_units = cfg.get("mlp_units", 256)
         self.reward_pred = RewardPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_dim, units=mlp_units)
 
+        # Bottleneck h for decoder: project h down to stoch_dim so that
+        # z (stoch_dim) and h_proj (stoch_dim) are equal-sized inputs.
+        # This prevents the decoder from ignoring z in favor of h.
+        # h keeps full hidden_dim for RSSM, reward predictor, and actor-critic.
+        decoder_h_dim = cfg.get("decoder_h_dim", stoch_dim)
+        self._decoder_h_proj = nn.Linear(hidden_dim, decoder_h_dim)
+        self.decoder = ConvDecoder(latent_dim=decoder_h_dim + stoch_dim, out_channels=obs_channels, depth=depth)
+
+        self._decoder_h_dim = decoder_h_dim
         self.kl_weight = cfg.get("kl_weight", 1.0)
         self.kl_balance = cfg.get("kl_balance", 0.8)
         self.free_bits = cfg.get("free_bits", 1.0)
         self.use_symlog = cfg.get("use_symlog", True)
+
+    def decode(self, h, z):
+        """Decode from (h, z) using h bottleneck projection."""
+        h_proj = self._decoder_h_proj(h)
+        return self.decoder(torch.cat([h_proj, z], dim=-1))
 
     def forward(self, obs, actions, rewards):
         """Forward pass for training.
@@ -69,12 +82,8 @@ class WorldModel(nn.Module):
         # Run RSSM
         h_seq, z_seq, priors, posteriors = self.rssm.observe_sequence(embeds, actions)
 
-        # Decode from (h, z) — detach h so reconstruction gradients only
-        # flow through z. This prevents the decoder from relying solely on
-        # h (256d) and ignoring z (32d), which causes posterior collapse.
-        # h still gets gradients from KL loss and reward prediction.
-        features = torch.cat([h_seq.detach(), z_seq], dim=-1)  # (B, T, hidden+stoch)
-        recon = self.decoder(features)  # (B, T, C, H, W)
+        # Decode from (h, z) via h bottleneck
+        recon = self.decode(h_seq, z_seq)  # (B, T, C, H, W)
 
         # Predict rewards
         reward_pred = self.reward_pred(h_seq, z_seq)  # (B, T)

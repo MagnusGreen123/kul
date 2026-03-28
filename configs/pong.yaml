@@ -14,7 +14,7 @@ mlp_units: 400
 # Training
 kl_weight: 1.0
 kl_balance: 0.8
-free_bits: 0.0             # no floor — h is detached in decoder, z must carry info
+free_bits: 1.0             # floor on sum — h bottleneck makes z essential for recon
 use_symlog: true
 horizon: 15
 gamma: 0.99

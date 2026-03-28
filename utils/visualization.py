@@ -9,13 +9,13 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 
-def latent_to_images(decoder, h_seq, z_seq, denormalize: bool = True):
+def latent_to_images(decode_fn, h_seq, z_seq, denormalize: bool = True):
     """Decode latent states to pixel images.
 
     Args:
-        decoder:  ConvDecoder
-        h_seq:    (B, T, hidden_dim) or (T, hidden_dim)
-        z_seq:    (B, T, stoch_dim) or (T, stoch_dim)
+        decode_fn: callable (h, z) -> reconstructed obs, or a ConvDecoder
+        h_seq:     (B, T, hidden_dim) or (T, hidden_dim)
+        z_seq:     (B, T, stoch_dim) or (T, stoch_dim)
         denormalize: if True, map [-0.5, 0.5] -> [0, 255]
 
     Returns:
@@ -26,9 +26,14 @@ def latent_to_images(decoder, h_seq, z_seq, denormalize: bool = True):
         h_seq = h_seq.unsqueeze(0)
         z_seq = z_seq.unsqueeze(0)
 
-    features = torch.cat([h_seq, z_seq], dim=-1)
     with torch.no_grad():
-        recon = decoder(features)  # (B, T, C, H, W)
+        if callable(getattr(decode_fn, 'forward', None)):
+            # Raw decoder (legacy) — concat h and z directly
+            features = torch.cat([h_seq, z_seq], dim=-1)
+            recon = decode_fn(features)
+        else:
+            # decode_fn is a callable (h, z) -> recon
+            recon = decode_fn(h_seq, z_seq)
 
     # Take first channel (grayscale) or mean across channels
     imgs = recon[:, :, 0].cpu().numpy()  # (B, T, H, W)

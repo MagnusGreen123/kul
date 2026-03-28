@@ -14,7 +14,7 @@ mlp_units: 400
 # Training
 kl_weight: 1.0
 kl_balance: 0.8
-free_bits: 1.0             # now clamped on sum (floor=1.0), not per-dim (was 32.0)
+free_bits: 0.0             # no floor — h is detached in decoder, so z must carry info
 use_symlog: true
 horizon: 15
 gamma: 0.99
@@ -43,4 +43,4 @@ buffer_max_steps: 500000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "short-test-v2-bugfix"
+run_name: "short-v3-detach-h"

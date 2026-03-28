@@ -69,8 +69,11 @@ class WorldModel(nn.Module):
         # Run RSSM
         h_seq, z_seq, priors, posteriors = self.rssm.observe_sequence(embeds, actions)
 
-        # Decode from (h, z)
-        features = torch.cat([h_seq, z_seq], dim=-1)  # (B, T, hidden+stoch)
+        # Decode from (h, z) — detach h so reconstruction gradients only
+        # flow through z. This prevents the decoder from relying solely on
+        # h (256d) and ignoring z (32d), which causes posterior collapse.
+        # h still gets gradients from KL loss and reward prediction.
+        features = torch.cat([h_seq.detach(), z_seq], dim=-1)  # (B, T, hidden+stoch)
         recon = self.decoder(features)  # (B, T, C, H, W)
 
         # Predict rewards

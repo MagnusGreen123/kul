@@ -22,6 +22,9 @@ lambda_: 0.95
 batch_size: 512
 batch_length: 30
 learning_rate: 3.0e-4      # was 1e-4 — higher LR for faster initial learning
+actor_lr: 8.0e-5
+critic_lr: 3.0e-5
+entropy_coeff: 3.0e-3
 max_grad_norm: 10.0
 mixed_precision: true
 

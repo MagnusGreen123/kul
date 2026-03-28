@@ -279,7 +279,9 @@ def main():
             # train_step now returns detached states, no redundant forward pass
             wm_losses, wm_info = wm_trainer.train_step(batch)
 
-            ac_losses = ac_trainer.train_step(wm_info["h_seq"], wm_info["z_seq"])
+            ac_losses = ac_trainer.train_step(
+                wm_info["h_seq"], wm_info["z_seq"], dones=wm_info.get("dones")
+            )
 
             all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
                           **{f"ac/{k}": v for k, v in ac_losses.items()}}
@@ -306,6 +308,7 @@ def main():
                 "world_model": wm.state_dict(),
                 "actor": actor.state_dict(),
                 "critic": critic.state_dict(),
+                "target_critic": ac_trainer.target_critic.state_dict(),
                 "wm_optimizer": wm_trainer.optimizer.state_dict(),
                 "actor_optimizer": ac_trainer.actor_opt.state_dict(),
                 "critic_optimizer": ac_trainer.critic_opt.state_dict(),

@@ -9,6 +9,22 @@ import numpy as np
 from gymnasium import spaces
 
 
+class FireResetWrapper(gym.Wrapper):
+    """Press FIRE on reset for envs that require it to start (e.g. Pong, Breakout).
+    Also fires after a life loss if the env uses 'FIRE' action."""
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        assert env.unwrapped.get_action_meanings()[1] == "FIRE"
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        obs, _, terminated, truncated, info = self.env.step(1)  # FIRE
+        if terminated or truncated:
+            obs, info = self.env.reset(**kwargs)
+        return obs, info
+
+
 class MaxAndSkipWrapper(gym.Wrapper):
     """Repeat action for `skip` frames, return max of last 2 frames.
     Standard for NoFrameskip Atari envs."""
@@ -161,6 +177,11 @@ def make_atari_env(env_name: str, size: int = 64, n_frames: int = 4,
     Output obs shape: (n_frames, size, size)  dtype: float32, range [-0.5, 0.5]
     """
     env = gym.make(env_name)
+    # FireReset for envs that need FIRE to start (Pong, Breakout, etc.)
+    if hasattr(env.unwrapped, "get_action_meanings") and \
+       len(env.unwrapped.get_action_meanings()) > 1 and \
+       env.unwrapped.get_action_meanings()[1] == "FIRE":
+        env = FireResetWrapper(env)
     env = MaxAndSkipWrapper(env, skip=4)
     env = GrayscaleWrapper(env)
     env = ResizeWrapper(env, size=size)

@@ -1,8 +1,8 @@
 """
 Actor-critic training via imagination rollouts through the world model.
 - Imagines H=15 steps using learned RSSM dynamics
-- Computes lambda-returns (lambda=0.95)
-- Trains actor with backprop through rollout (straight-through gradients)
+- Computes lambda-returns (lambda=0.95) with proper bootstrap
+- Trains actor with backprop through rollout + entropy regularization
 - Trains critic with MSE on lambda-return targets
 """
 
@@ -18,29 +18,29 @@ from models.critic import Critic
 from training.world_model import WorldModel, symlog, symexp
 
 
-def compute_lambda_returns(rewards, values, gamma: float = 0.99, lambda_: float = 0.95):
+def compute_lambda_returns(rewards, values, bootstrap, gamma: float = 0.997,
+                           lambda_: float = 0.95):
     """Compute lambda-returns for a sequence.
 
     Args:
-        rewards: (B, H) predicted rewards from imagination
-        values:  (B, H) value estimates
-        gamma:   discount factor
-        lambda_: trace decay
+        rewards:   (B, H) predicted rewards from imagination
+        values:    (B, H) value estimates for states s_1..s_H
+        bootstrap: (B,) value estimate for state s_{H+1} (beyond horizon)
+        gamma:     discount factor
+        lambda_:   trace decay
 
     Returns:
         (B, H) lambda-return targets
     """
     B, H = rewards.shape
     returns = torch.zeros_like(rewards)
-    last = values[:, -1]
 
     for t in reversed(range(H)):
-        if t == H - 1:
-            returns[:, t] = rewards[:, t] + gamma * last
-        else:
-            returns[:, t] = rewards[:, t] + gamma * (
-                (1 - lambda_) * values[:, t + 1] + lambda_ * returns[:, t + 1]
-            )
+        next_val = bootstrap if t == H - 1 else values[:, t + 1]
+        next_ret = bootstrap if t == H - 1 else returns[:, t + 1]
+        returns[:, t] = rewards[:, t] + gamma * (
+            (1 - lambda_) * next_val + lambda_ * next_ret
+        )
 
     return returns
 
@@ -54,9 +54,10 @@ class ActorCriticTrainer:
         self.device = device
 
         self.horizon = cfg.get("horizon", 15)
-        self.gamma = cfg.get("gamma", 0.99)
+        self.gamma = cfg.get("gamma", 0.997)
         self.lambda_ = cfg.get("lambda_", 0.95)
         self.use_symlog = cfg.get("use_symlog", True)
+        self.entropy_coeff = cfg.get("entropy_coeff", 1e-3)
 
         actor_lr = cfg.get("actor_lr", cfg.get("learning_rate", 3e-4))
         critic_lr = cfg.get("critic_lr", cfg.get("learning_rate", 3e-4))
@@ -67,22 +68,21 @@ class ActorCriticTrainer:
     def imagine_rollout(self, initial_h, initial_z):
         """Roll out in imagination using actor policy through RSSM.
 
-        Args:
-            initial_h: (B, hidden_dim) - starting deterministic state
-            initial_z: (B, stoch_dim) - starting stochastic state
-
         Returns:
-            h_seq:   (B, H, hidden_dim)
-            z_seq:   (B, H, stoch_dim)
-            actions: (B, H, act_dim)
-            rewards: (B, H)
-            values:  (B, H)
+            h_seq:     (B, H, hidden_dim)
+            z_seq:     (B, H, stoch_dim)
+            actions:   (B, H, act_dim)
+            rewards:   (B, H)
+            values:    (B, H)
+            entropies: (B, H)
+            bootstrap: (B,) — value estimate for state beyond horizon
         """
         h, z = initial_h, initial_z
-        h_list, z_list, action_list, reward_list, value_list = [], [], [], [], []
+        h_list, z_list, action_list = [], [], []
+        reward_list, value_list, entropy_list = [], [], []
 
         for _ in range(self.horizon):
-            action, _ = self.actor.get_action(h, z)
+            action, _, entropy = self.actor.get_action(h, z)
             h, z, _ = self.world_model.rssm.imagine_step(h, z, action)
 
             reward = self.world_model.reward_pred(h, z)
@@ -93,6 +93,12 @@ class ActorCriticTrainer:
             action_list.append(action)
             reward_list.append(reward)
             value_list.append(value)
+            entropy_list.append(entropy)
+
+        # Bootstrap: value of state one step beyond horizon
+        boot_action, _, _ = self.actor.get_action(h, z)
+        h_boot, z_boot, _ = self.world_model.rssm.imagine_step(h, z, boot_action)
+        bootstrap = self.critic(h_boot, z_boot)
 
         return (
             torch.stack(h_list, dim=1),
@@ -100,14 +106,12 @@ class ActorCriticTrainer:
             torch.stack(action_list, dim=1),
             torch.stack(reward_list, dim=1),
             torch.stack(value_list, dim=1),
+            torch.stack(entropy_list, dim=1),
+            bootstrap,
         )
 
     def train_step(self, h_seq, z_seq):
         """Train actor and critic from world model states.
-
-        Uses a single imagination rollout (not two). Freezes world model
-        parameters during imagination so only actor gradients are computed,
-        saving ~50% GPU memory.
 
         Args:
             h_seq: (B, T, hidden_dim) from world model observe pass
@@ -129,21 +133,21 @@ class ActorCriticTrainer:
             p.requires_grad_(False)
 
         # Single imagination rollout
-        h_imag, z_imag, actions, rewards, values = self.imagine_rollout(
-            start_h, start_z
-        )
+        h_imag, z_imag, actions, rewards, values, entropies, bootstrap = \
+            self.imagine_rollout(start_h, start_z)
 
         if self.use_symlog:
             rewards = symexp(rewards)
 
-        # Lambda-returns with gradient through rewards (actor influences them)
+        # Lambda-returns with proper bootstrap from state beyond horizon
         # Values detached so critic serves as a fixed baseline
         lambda_returns = compute_lambda_returns(
-            rewards, values.detach(), self.gamma, self.lambda_
+            rewards, values.detach(), bootstrap.detach(),
+            self.gamma, self.lambda_
         )
 
-        # ── Actor loss ── (maximise lambda-returns)
-        actor_loss = -lambda_returns.mean()
+        # ── Actor loss ── (maximise lambda-returns + entropy bonus)
+        actor_loss = -(lambda_returns.mean() + self.entropy_coeff * entropies.mean())
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
@@ -168,6 +172,7 @@ class ActorCriticTrainer:
             "critic_loss": critic_loss.item(),
             "imagined_reward": rewards.mean().item(),
             "imagined_value": values.mean().item(),
+            "entropy": entropies.mean().item(),
         }
 
 
@@ -182,16 +187,19 @@ if __name__ == "__main__":
         "stoch_dim": 32,
         "act_dim": 4,
         "cnn_depth": 32,
-        "kl_weight": 1.0,
+        "kl_weight": 0.1,
         "kl_balance": 0.8,
         "free_bits": 1.0,
         "use_symlog": True,
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-4,
+        "actor_lr": 3e-5,
+        "critic_lr": 3e-5,
         "mixed_precision": False,
         "max_grad_norm": 100.0,
         "horizon": 15,
-        "gamma": 0.99,
+        "gamma": 0.997,
         "lambda_": 0.95,
+        "entropy_coeff": 1e-3,
     }
 
     wm = WorldModel(cfg).to(device)

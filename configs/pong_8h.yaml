@@ -1,0 +1,49 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# RSSM dimensions
+embed_dim: 512
+hidden_dim: 256
+stoch_dim: 32
+act_dim: 6
+obs_channels: 4
+cnn_depth: 48
+mlp_units: 400
+
+# Training — tuned against DreamerV2/V3 papers
+kl_weight: 0.1
+kl_balance: 0.8
+free_bits: 1.0
+use_symlog: true
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4      # world model LR
+actor_lr: 3.0e-5
+critic_lr: 3.0e-5
+entropy_coeff: 1.0e-3
+max_grad_norm: 100.0
+mixed_precision: true
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.5            # 2000 gradient steps per 4000 env steps
+
+# Schedule — ~8 hour run
+prefill_steps: 10000
+total_steps: 200000
+checkpoint_every: 25000
+log_every: 4000
+eval_every: 25000
+
+# Buffer
+buffer_max_steps: 2000000
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "v5-full-audit-8h"

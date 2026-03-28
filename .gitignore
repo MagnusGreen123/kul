@@ -5,3 +5,4 @@ __pycache__/
 .env
 wandb/
 *.png
+wandb_fetch.py

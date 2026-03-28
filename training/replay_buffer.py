@@ -5,6 +5,7 @@ Observations are stored as uint8 to save ~4x memory.
 """
 
 import collections
+import threading
 
 import numpy as np
 import torch
@@ -35,6 +36,7 @@ class EpisodeReplayBuffer:
         self.batch_length = batch_length
         self.episodes: collections.deque[dict[str, np.ndarray]] = collections.deque()
         self._total_steps = 0
+        self._lock = threading.Lock()
 
     @property
     def total_steps(self) -> int:
@@ -70,13 +72,14 @@ class EpisodeReplayBuffer:
             "reward": np.asarray(rewards, dtype=np.float32),
             "done": np.asarray(dones, dtype=np.float32),
         }
-        self._total_steps += ep_len
-        self.episodes.append(episode)
+        with self._lock:
+            self._total_steps += ep_len
+            self.episodes.append(episode)
 
-        # Evict oldest episodes until under step budget
-        while self._total_steps > self.max_total_steps and len(self.episodes) > 1:
-            removed = self.episodes.popleft()
-            self._total_steps -= len(removed["reward"])
+            # Evict oldest episodes until under step budget
+            while self._total_steps > self.max_total_steps and len(self.episodes) > 1:
+                removed = self.episodes.popleft()
+                self._total_steps -= len(removed["reward"])
 
     def sample(self, batch_size: int, device: torch.device = torch.device("cpu")
                ) -> dict[str, torch.Tensor]:
@@ -85,27 +88,28 @@ class EpisodeReplayBuffer:
         Returns dict with tensors of shape (B, L, ...).
         Episodes shorter than batch_length are skipped.
         """
-        valid = [ep for ep in self.episodes if len(ep["reward"]) >= self.batch_length]
-        if not valid:
-            raise ValueError(
-                f"No episodes with length >= {self.batch_length}. "
-                f"Have {len(self.episodes)} episodes, "
-                f"longest: {max(len(e['reward']) for e in self.episodes) if self.episodes else 0}"
-            )
+        with self._lock:
+            valid = [ep for ep in self.episodes if len(ep["reward"]) >= self.batch_length]
+            if not valid:
+                raise ValueError(
+                    f"No episodes with length >= {self.batch_length}. "
+                    f"Have {len(self.episodes)} episodes, "
+                    f"longest: {max(len(e['reward']) for e in self.episodes) if self.episodes else 0}"
+                )
 
-        obs_list, act_list, rew_list, done_list = [], [], [], []
-        rng = np.random.default_rng()
+            obs_list, act_list, rew_list, done_list = [], [], [], []
+            rng = np.random.default_rng()
 
-        for _ in range(batch_size):
-            ep = valid[rng.integers(len(valid))]
-            max_start = len(ep["reward"]) - self.batch_length
-            start = rng.integers(max_start + 1)
-            end = start + self.batch_length
+            for _ in range(batch_size):
+                ep = valid[rng.integers(len(valid))]
+                max_start = len(ep["reward"]) - self.batch_length
+                start = rng.integers(max_start + 1)
+                end = start + self.batch_length
 
-            obs_list.append(ep["obs"][start:end])
-            act_list.append(ep["action"][start:end])
-            rew_list.append(ep["reward"][start:end])
-            done_list.append(ep["done"][start:end])
+                obs_list.append(ep["obs"][start:end])
+                act_list.append(ep["action"][start:end])
+                rew_list.append(ep["reward"][start:end])
+                done_list.append(ep["done"][start:end])
 
         # Decompress uint8 obs to float32 [-0.5, 0.5]
         obs_np = np.stack(obs_list).astype(np.float32) / 255.0 - 0.5

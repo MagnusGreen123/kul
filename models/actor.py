@@ -47,7 +47,7 @@ class Actor(nn.Module):
             return TransformedDistribution(base_dist, [TanhTransform(cache_size=1)])
 
     def get_action(self, h: torch.Tensor, z: torch.Tensor):
-        """Sample action and return (action, log_prob).
+        """Sample action and return (action, log_prob, entropy).
 
         For discrete: uses straight-through gradients so that the forward
         pass sees a hard one-hot but gradients flow through the softmax
@@ -58,6 +58,7 @@ class Actor(nn.Module):
         if self.discrete:
             action_idx = dist.sample()
             log_prob = dist.log_prob(action_idx)
+            entropy = dist.entropy()
             # One-hot for feeding back into RSSM
             action_onehot = torch.zeros(*action_idx.shape, self.act_dim,
                                         device=h.device)
@@ -66,11 +67,12 @@ class Actor(nn.Module):
             # backward gradient flows through probs -> logits -> actor
             probs = dist.probs
             action_st = action_onehot + probs - probs.detach()
-            return action_st, log_prob
+            return action_st, log_prob, entropy
         else:
             action = dist.rsample()
             log_prob = dist.log_prob(action).sum(-1)
-            return action, log_prob
+            entropy = dist.entropy().sum(-1)
+            return action, log_prob, entropy
 
 
 if __name__ == "__main__":
@@ -80,12 +82,12 @@ if __name__ == "__main__":
     actor_d = Actor(hidden_dim=256, stoch_dim=32, act_dim=4, discrete=True).to(device)
     h = torch.randn(8, 256, device=device)
     z = torch.randn(8, 32, device=device)
-    action, log_prob = actor_d.get_action(h, z)
-    print(f"Discrete action: {action.shape}, log_prob: {log_prob.shape}")
+    action, log_prob, entropy = actor_d.get_action(h, z)
+    print(f"Discrete action: {action.shape}, log_prob: {log_prob.shape}, entropy: {entropy.shape}")
 
     # Test continuous
     actor_c = Actor(hidden_dim=256, stoch_dim=32, act_dim=2, discrete=False).to(device)
-    action, log_prob = actor_c.get_action(h, z)
+    action, log_prob, entropy = actor_c.get_action(h, z)
     print(f"Continuous action: {action.shape}, log_prob: {log_prob.shape}")
 
     print(f"Discrete params:   {sum(p.numel() for p in actor_d.parameters()):,}")

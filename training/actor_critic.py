@@ -3,7 +3,7 @@ Actor-critic training via imagination rollouts through the world model.
 - Imagines H=15 steps using learned RSSM dynamics
 - Computes lambda-returns (lambda=0.95) with proper bootstrap
 - Uses target critic (EMA / Polyak) for stable value targets
-- Trains actor with REINFORCE (log_prob * advantage) + entropy regularization
+- Trains actor with REINFORCE (log_prob * normalized_return) + entropy regularization
 - Trains critic with MSE on lambda-return targets from target critic
 """
 
@@ -208,13 +208,14 @@ class ActorCriticTrainer:
             self.gamma, self.lambda_, continuations=conts
         )
 
-        # ── Actor loss ── REINFORCE: log_prob weighted by normalized advantage
-        # Advantage = how much better than expected (baseline = values)
-        advantage = (lambda_returns - values).detach()
-        # Normalize advantage for stable gradients
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-        # REINFORCE: gradient flows through log_probs directly to actor
-        actor_loss = -(advantage * log_probs).mean() - self.entropy_coeff * entropies.mean()
+        # ── Actor loss ── REINFORCE with DreamerV3-style return normalization
+        # Percentile-normalize returns to roughly [0, 1] — this avoids the
+        # problem where z-score advantage normalization amplifies noise to
+        # unit variance when rewards are sparse, causing entropy collapse.
+        normed_returns = self._normalize_returns(lambda_returns)
+        # REINFORCE: use normalized returns as weights (no baseline subtraction,
+        # per DreamerV3 — the critic is only used for lambda-return bootstrap)
+        actor_loss = -(normed_returns.detach() * log_probs).mean() - self.entropy_coeff * entropies.mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()

@@ -24,7 +24,7 @@ batch_length: 30
 learning_rate: 1.0e-4
 actor_lr: 8.0e-5
 critic_lr: 3.0e-5
-entropy_coeff: 3.0e-3
+entropy_coeff: 1.0e-2
 max_grad_norm: 10.0
 mixed_precision: true
 
@@ -47,3 +47,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
+run_name: "v9-return-norm"

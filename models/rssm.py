@@ -181,20 +181,25 @@ def kl_loss(priors, posteriors, free_bits: float = 1.0, balance: float = 0.8):
         balance:    weight on posterior (0.8 = mostly train prior toward posterior)
 
     Returns:
-        scalar KL loss
+        (scalar KL loss, scalar raw KL before free_bits clipping)
     """
     kl_prior_grad = []   # gradient flows to prior only
     kl_post_grad = []    # gradient flows to posterior only
+    kl_raw_list = []     # raw KL for diagnostics
 
     for prior, post in zip(priors, posteriors):
         # Detach by creating new distributions from detached params
         prior_detached = Normal(prior.loc.detach(), prior.scale.detach())
         post_detached = Normal(post.loc.detach(), post.scale.detach())
 
+        # Raw KL (before free_bits) for logging
+        raw_kl = kl_divergence(post_detached, prior).sum(-1)
+        kl_raw_list.append(raw_kl.detach())
+
         # Train prior toward posterior (posterior is fixed target)
         # Clamp on the sum (not per-dim) — per-dim clamping creates a floor
         # of free_bits*stoch_dim which kills all KL gradients.
-        kl_to_prior = kl_divergence(post_detached, prior).sum(-1).clamp(min=free_bits)
+        kl_to_prior = raw_kl.clamp(min=free_bits)
         # Train posterior toward prior (prior is fixed target)
         kl_to_post = kl_divergence(post, prior_detached).sum(-1).clamp(min=free_bits)
 
@@ -203,8 +208,9 @@ def kl_loss(priors, posteriors, free_bits: float = 1.0, balance: float = 0.8):
 
     kl_prior = torch.stack(kl_prior_grad, dim=1).mean()  # (B, T) -> scalar
     kl_post = torch.stack(kl_post_grad, dim=1).mean()
+    kl_raw = torch.stack(kl_raw_list, dim=1).mean()
 
-    return balance * kl_prior + (1 - balance) * kl_post
+    return balance * kl_prior + (1 - balance) * kl_post, kl_raw
 
 
 if __name__ == "__main__":
@@ -224,8 +230,8 @@ if __name__ == "__main__":
     print(f"z_seq: {z_seq.shape}")  # (4, 20, 32)
 
     # KL loss
-    kl = kl_loss(priors, posteriors)
-    print(f"KL loss: {kl.item():.3f}")
+    kl, kl_raw = kl_loss(priors, posteriors)
+    print(f"KL loss: {kl.item():.3f}, raw KL: {kl_raw.item():.3f}")
 
     # Imagine sequence
     def dummy_actor(h, z):

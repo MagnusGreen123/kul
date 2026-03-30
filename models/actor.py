@@ -5,16 +5,19 @@ Supports discrete (Categorical) and continuous (TanhNormal) actions.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical, Normal, TransformedDistribution
 from torch.distributions.transforms import TanhTransform
 
 
 class Actor(nn.Module):
     def __init__(self, hidden_dim: int = 256, stoch_dim: int = 32,
-                 act_dim: int = 4, units: int = 256, discrete: bool = True):
+                 act_dim: int = 4, units: int = 256, discrete: bool = True,
+                 unimix: float = 0.01):
         super().__init__()
         self.discrete = discrete
         self.act_dim = act_dim
+        self.unimix = unimix
 
         self.trunk = nn.Sequential(
             nn.Linear(hidden_dim + stoch_dim, units),
@@ -38,6 +41,12 @@ class Actor(nn.Module):
 
         if self.discrete:
             logits = self.head(x)
+            # Unimix: blend with uniform distribution to prevent entropy collapse
+            # without needing a large entropy bonus (DreamerV3 technique)
+            if self.unimix > 0:
+                probs = F.softmax(logits, dim=-1)
+                probs = (1 - self.unimix) * probs + self.unimix / self.act_dim
+                return Categorical(probs=probs)
             return Categorical(logits=logits)
         else:
             mean = self.mean_head(x)

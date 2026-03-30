@@ -99,7 +99,7 @@ class WorldModel(nn.Module):
         recon_loss = F.mse_loss(recon, obs)
 
         # KL divergence with balancing and free bits
-        kl = kl_loss(priors, posteriors, free_bits=self.free_bits, balance=self.kl_balance)
+        kl, kl_raw = kl_loss(priors, posteriors, free_bits=self.free_bits, balance=self.kl_balance)
 
         # Reward loss (symlog targets for stability)
         if self.use_symlog:
@@ -120,6 +120,7 @@ class WorldModel(nn.Module):
             "total": total_loss,
             "recon": recon_loss,
             "kl": kl,
+            "kl_raw": kl_raw,
             "reward": reward_loss,
             "cont": cont_loss,
         }

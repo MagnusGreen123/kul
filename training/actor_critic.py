@@ -3,7 +3,8 @@ Actor-critic training via imagination rollouts through the world model.
 - Imagines H=15 steps using learned RSSM dynamics
 - Computes lambda-returns (lambda=0.95) with proper bootstrap
 - Uses target critic (EMA / Polyak) for stable value targets
-- Trains actor with REINFORCE (log_prob * normalized_return) + entropy regularization
+- Trains actor with REINFORCE (log_prob * advantage) + entropy regularization
+  where advantage = normalized_return - normalized_V(s_t) baseline
 - Trains critic with MSE on lambda-return targets from target critic
 """
 
@@ -21,14 +22,13 @@ from models.critic import Critic
 from training.world_model import WorldModel, symlog, symexp
 
 
-def compute_lambda_returns(rewards, values, bootstrap, gamma: float = 0.997,
+def compute_lambda_returns(rewards, values, gamma: float = 0.997,
                            lambda_: float = 0.95, continuations=None):
     """Compute lambda-returns for a sequence.
 
     Args:
         rewards:       (B, H) predicted rewards from imagination
-        values:        (B, H) value estimates for states s_1..s_H
-        bootstrap:     (B,) value estimate for state s_{H+1} (beyond horizon)
+        values:        (B, H) value estimates V(s_{t+1}) for state reached after each action
         gamma:         discount factor
         lambda_:       trace decay
         continuations: (B, H) predicted P(continue) per step, or None (all 1)
@@ -38,15 +38,14 @@ def compute_lambda_returns(rewards, values, bootstrap, gamma: float = 0.997,
     """
     B, H = rewards.shape
     returns = torch.zeros_like(rewards)
+    next_return = values[:, -1]  # bootstrap from V(s_H)
 
     for t in reversed(range(H)):
-        next_val = bootstrap if t == H - 1 else values[:, t + 1]
-        next_ret = bootstrap if t == H - 1 else returns[:, t + 1]
-        # Discount by gamma * cont — at terminal states cont→0, zeroing bootstrap
         cont = 1.0 if continuations is None else continuations[:, t]
         returns[:, t] = rewards[:, t] + gamma * cont * (
-            (1 - lambda_) * next_val + lambda_ * next_ret
+            (1 - lambda_) * values[:, t] + lambda_ * next_return
         )
+        next_return = returns[:, t]
 
     return returns
 
@@ -118,25 +117,28 @@ class ActorCriticTrainer:
             h_seq:          (B, H, hidden_dim)
             z_seq:          (B, H, stoch_dim)
             rewards:        (B, H)
-            values:         (B, H)  — from target_critic (no grad)
+            values:         (B, H)  — V(s_{t+1}) from target_critic (no grad)
             log_probs:      (B, H)  — log P(action) under actor (has grad)
             entropies:      (B, H)
             continuations:  (B, H)  — P(continue) from cont_pred (no grad)
-            bootstrap:      (B,) — target_critic value for state beyond horizon
+            pre_values:     (B, H)  — V(s_t) baseline from target_critic (no grad)
         """
         h, z = initial_h, initial_z
         h_list, z_list = [], []
         reward_list, value_list = [], []
         log_prob_list, entropy_list, cont_list = [], [], []
+        pre_value_list = []
 
         for _ in range(self.horizon):
+            with torch.no_grad():
+                pre_value = self.target_critic(h, z)  # V(s_t) before action
+            pre_value_list.append(pre_value)
+
             action, log_prob, entropy = self.actor.get_action(h, z)
-            # Detach action before feeding to RSSM — REINFORCE doesn't
-            # need gradients through dynamics, only through log_prob
             with torch.no_grad():
                 h, z, _ = self.world_model.rssm.imagine_step(h, z, action.detach())
                 reward = self.world_model.reward_pred(h, z)
-                value = self.target_critic(h, z)
+                value = self.target_critic(h, z)  # V(s_{t+1}) after action
                 cont = torch.sigmoid(self.world_model.cont_pred(h, z))
 
             h_list.append(h)
@@ -147,12 +149,6 @@ class ActorCriticTrainer:
             entropy_list.append(entropy)
             cont_list.append(cont)
 
-        # Bootstrap: value of state one step beyond horizon (target critic)
-        with torch.no_grad():
-            boot_action, _, _ = self.actor.get_action(h, z)
-            h_boot, z_boot, _ = self.world_model.rssm.imagine_step(h, z, boot_action)
-            bootstrap = self.target_critic(h_boot, z_boot)
-
         return (
             torch.stack(h_list, dim=1),
             torch.stack(z_list, dim=1),
@@ -161,7 +157,7 @@ class ActorCriticTrainer:
             torch.stack(log_prob_list, dim=1),
             torch.stack(entropy_list, dim=1),
             torch.stack(cont_list, dim=1),
-            bootstrap,
+            torch.stack(pre_value_list, dim=1),
         )
 
     def train_step(self, h_seq, z_seq, dones=None):
@@ -195,27 +191,28 @@ class ActorCriticTrainer:
         start_z = z_seq[torch.arange(B), t_indices].detach()
 
         # Imagination rollout — RSSM runs in no_grad, only actor log_probs have grad
-        h_imag, z_imag, rewards, values, log_probs, entropies, conts, bootstrap = \
+        h_imag, z_imag, rewards, values, log_probs, entropies, conts, pre_values = \
             self.imagine_rollout(start_h, start_z)
 
         if self.use_symlog:
             rewards = symexp(rewards)
 
-        # Lambda-returns with stable bootstrap from target critic,
+        # Lambda-returns bootstrapped from V(s_H) = values[:, -1],
         # discounted by predicted continuation (done masking)
         lambda_returns = compute_lambda_returns(
-            rewards, values, bootstrap,
+            rewards, values,
             self.gamma, self.lambda_, continuations=conts
         )
 
-        # ── Actor loss ── REINFORCE with DreamerV3-style return normalization
-        # Percentile-normalize returns to roughly [0, 1] — this avoids the
-        # problem where z-score advantage normalization amplifies noise to
-        # unit variance when rewards are sparse, causing entropy collapse.
+        # ── Actor loss ── REINFORCE with value baseline and return normalization
+        # Percentile-normalize returns to roughly [0, 1], then subtract
+        # normalized V(s_t) baseline to reduce gradient variance.
         normed_returns = self._normalize_returns(lambda_returns)
-        # REINFORCE: use normalized returns as weights (no baseline subtraction,
-        # per DreamerV3 — the critic is only used for lambda-return bootstrap)
-        actor_loss = -(normed_returns.detach() * log_probs).mean() - self.entropy_coeff * entropies.mean()
+        with torch.no_grad():
+            scale = (self._return_ema_high - self._return_ema_low).clamp(min=1.0)
+            normed_baseline = (pre_values - self._return_ema_low) / scale
+        advantages = normed_returns - normed_baseline
+        actor_loss = -(advantages.detach() * log_probs).mean() - self.entropy_coeff * entropies.mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()

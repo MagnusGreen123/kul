@@ -72,11 +72,7 @@ class Actor(nn.Module):
             action_onehot = torch.zeros(*action_idx.shape, self.act_dim,
                                         device=h.device)
             action_onehot.scatter_(-1, action_idx.unsqueeze(-1), 1.0)
-            # Straight-through: forward value = one-hot (probs cancel),
-            # backward gradient flows through probs -> logits -> actor
-            probs = dist.probs
-            action_st = action_onehot + probs - probs.detach()
-            return action_st, log_prob, entropy
+            return action_onehot, log_prob, entropy
         else:
             action = dist.rsample()
             log_prob = dist.log_prob(action).sum(-1)

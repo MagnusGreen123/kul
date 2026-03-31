@@ -311,7 +311,28 @@ def main():
     total_steps = cfg["total_steps"]
     train_ratio = cfg.get("train_ratio", 1.0)  # gradient steps per env step
 
+    def save_checkpoint(tag=None):
+        """Save checkpoint. Used both for regular saves and emergency recovery."""
+        name = f"step_{global_step}.pt" if tag is None else f"step_{global_step}_{tag}.pt"
+        path = ckpt_dir / name
+        torch.save({
+            "global_step": global_step,
+            "episode_count": episode_count,
+            "world_model": wm.state_dict(),
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+            "target_critic": ac_trainer.target_critic.state_dict(),
+            "wm_optimizer": wm_trainer.optimizer.state_dict(),
+            "actor_optimizer": ac_trainer.actor_opt.state_dict(),
+            "critic_optimizer": ac_trainer.critic_opt.state_dict(),
+        }, path)
+        print(f"Saved checkpoint: {path}")
+
+    crash_count = 0
+    max_crashes = 5
+
     while global_step < total_steps:
+      try:
         # ── Collect phase ──
         episodes, steps = collector.collect_steps(collect_per_step, random=False)
         global_step += steps
@@ -366,19 +387,7 @@ def main():
 
         # ── Checkpoint ──
         if global_step % cfg.get("checkpoint_every", 10000) < collect_per_step + 1000:
-            ckpt_path = ckpt_dir / f"step_{global_step}.pt"
-            torch.save({
-                "global_step": global_step,
-                "episode_count": episode_count,
-                "world_model": wm.state_dict(),
-                "actor": actor.state_dict(),
-                "critic": critic.state_dict(),
-                "target_critic": ac_trainer.target_critic.state_dict(),
-                "wm_optimizer": wm_trainer.optimizer.state_dict(),
-                "actor_optimizer": ac_trainer.actor_opt.state_dict(),
-                "critic_optimizer": ac_trainer.critic_opt.state_dict(),
-            }, ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
+            save_checkpoint()
 
         # ── Visualization ──
         if global_step % cfg.get("eval_every", 10000) < collect_per_step + 1000:
@@ -402,6 +411,27 @@ def main():
                 del vis_batch, vis_info
             except Exception as e:
                 print(f"Visualization failed: {e}")
+
+        # Reset crash counter on successful iteration
+        crash_count = 0
+
+      except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        save_checkpoint(tag="interrupted")
+        break
+      except Exception as e:
+        crash_count += 1
+        print(f"\n{'='*60}")
+        print(f"CRASH #{crash_count} at step {global_step}: {e}")
+        print(f"{'='*60}")
+        traceback.print_exc()
+        save_checkpoint(tag="crash")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        if crash_count >= max_crashes:
+            print(f"Hit {max_crashes} consecutive crashes, giving up.")
+            break
+        print("Recovering and continuing...")
 
     collector.close()
     logger.close()

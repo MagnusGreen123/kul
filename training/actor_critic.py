@@ -3,8 +3,7 @@ Actor-critic training via imagination rollouts through the world model.
 - Imagines H=15 steps using learned RSSM dynamics
 - Computes lambda-returns (lambda=0.95) with proper bootstrap
 - Uses target critic (EMA / Polyak) for stable value targets
-- Trains actor with REINFORCE (log_prob * advantage) + entropy regularization
-  where advantage = normalized_return - normalized_V(s_t) baseline
+- Trains actor with REINFORCE (log_prob * normalized_return) + entropy regularization
 - Trains critic with MSE on lambda-return targets from target critic
 """
 
@@ -121,19 +120,13 @@ class ActorCriticTrainer:
             log_probs:      (B, H)  — log P(action) under actor (has grad)
             entropies:      (B, H)
             continuations:  (B, H)  — P(continue) from cont_pred (no grad)
-            pre_values:     (B, H)  — V(s_t) baseline from target_critic (no grad)
         """
         h, z = initial_h, initial_z
         h_list, z_list = [], []
         reward_list, value_list = [], []
         log_prob_list, entropy_list, cont_list = [], [], []
-        pre_value_list = []
 
         for _ in range(self.horizon):
-            with torch.no_grad():
-                pre_value = self.target_critic(h, z)  # V(s_t) before action
-            pre_value_list.append(pre_value)
-
             action, log_prob, entropy = self.actor.get_action(h, z)
             with torch.no_grad():
                 h, z, _ = self.world_model.rssm.imagine_step(h, z, action.detach())
@@ -157,7 +150,6 @@ class ActorCriticTrainer:
             torch.stack(log_prob_list, dim=1),
             torch.stack(entropy_list, dim=1),
             torch.stack(cont_list, dim=1),
-            torch.stack(pre_value_list, dim=1),
         )
 
     def train_step(self, h_seq, z_seq, dones=None):
@@ -191,7 +183,7 @@ class ActorCriticTrainer:
         start_z = z_seq[torch.arange(B), t_indices].detach()
 
         # Imagination rollout — RSSM runs in no_grad, only actor log_probs have grad
-        h_imag, z_imag, rewards, values, log_probs, entropies, conts, pre_values = \
+        h_imag, z_imag, rewards, values, log_probs, entropies, conts = \
             self.imagine_rollout(start_h, start_z)
 
         if self.use_symlog:
@@ -204,15 +196,11 @@ class ActorCriticTrainer:
             self.gamma, self.lambda_, continuations=conts
         )
 
-        # ── Actor loss ── REINFORCE with value baseline and return normalization
-        # Percentile-normalize returns to roughly [0, 1], then subtract
-        # normalized V(s_t) baseline to reduce gradient variance.
+        # ── Actor loss ── REINFORCE with DreamerV3-style return normalization
+        # Percentile-normalize returns to roughly [0, 1]. No baseline subtraction:
+        # early in training V(s) ≈ constant, so advantage ≈ 0 kills all gradient.
         normed_returns = self._normalize_returns(lambda_returns)
-        with torch.no_grad():
-            scale = (self._return_ema_high - self._return_ema_low).clamp(min=1.0)
-            normed_baseline = (pre_values - self._return_ema_low) / scale
-        advantages = normed_returns - normed_baseline
-        actor_loss = -(advantages.detach() * log_probs).mean() - self.entropy_coeff * entropies.mean()
+        actor_loss = -(normed_returns.detach() * log_probs).mean() - self.entropy_coeff * entropies.mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()

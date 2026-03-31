@@ -160,9 +160,18 @@ def make_batch_actions_onehot(actions_tensor, act_dim):
     return actions_tensor  # already (B, T, act_dim)
 
 
+def find_latest_checkpoint(ckpt_dir: Path):
+    """Find the checkpoint with the highest step number."""
+    ckpts = sorted(ckpt_dir.glob("step_*.pt"),
+                   key=lambda p: int(p.stem.split("_")[1]))
+    return ckpts[-1] if ckpts else None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -212,6 +221,34 @@ def main():
     wm_trainer = WorldModelTrainer(wm, cfg, device)
     ac_trainer = ActorCriticTrainer(actor, critic, wm, cfg, device)
 
+    # ── Dirs ──
+    ckpt_dir = Path("checkpoints")
+    ckpt_dir.mkdir(exist_ok=True)
+    runs_dir = Path("runs")
+    runs_dir.mkdir(exist_ok=True)
+
+    # ── Resume from checkpoint ──
+    global_step = 0
+    episode_count = 0
+    if args.resume:
+        ckpt_path = find_latest_checkpoint(ckpt_dir)
+        if ckpt_path is not None:
+            print(f"Resuming from {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            wm.load_state_dict(ckpt["world_model"])
+            actor.load_state_dict(ckpt["actor"])
+            critic.load_state_dict(ckpt["critic"])
+            ac_trainer.target_critic.load_state_dict(ckpt["target_critic"])
+            wm_trainer.optimizer.load_state_dict(ckpt["wm_optimizer"])
+            ac_trainer.actor_opt.load_state_dict(ckpt["actor_optimizer"])
+            ac_trainer.critic_opt.load_state_dict(ckpt["critic_optimizer"])
+            global_step = ckpt["global_step"]
+            episode_count = ckpt.get("episode_count", 0)
+            print(f"Resumed at step {global_step}, episode {episode_count}")
+            del ckpt
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
     # ── Parallel collector ──
     collector = ParallelCollector(
         cfg["env"], n_envs, actor, wm.encoder, wm.rssm, device, act_dim,
@@ -226,12 +263,6 @@ def main():
 
     # ── Logger ──
     logger = Logger(cfg, use_wandb=cfg.get("use_wandb", False))
-
-    # ── Dirs ──
-    ckpt_dir = Path("checkpoints")
-    ckpt_dir.mkdir(exist_ok=True)
-    runs_dir = Path("runs")
-    runs_dir.mkdir(exist_ok=True)
 
     # ── Prefill ──
     print(f"Prefilling {cfg['prefill_steps']} steps with random actions ({n_envs} envs)...")
@@ -251,8 +282,6 @@ def main():
     print(f"Prefilled {prefill_steps} steps in {len(buffer)} episodes")
 
     # ── Main loop ──
-    global_step = 0
-    episode_count = 0
     total_steps = cfg["total_steps"]
     collect_per_step = cfg.get("collect_per_step", 1000)  # env steps between training
     train_ratio = cfg.get("train_ratio", 1.0)  # gradient steps per env step
@@ -273,21 +302,26 @@ def main():
         n_train = max(1, int(steps * train_ratio))
         prefetcher = AsyncBatchPrefetcher(buffer, cfg["batch_size"], act_dim, device)
 
-        for _ in range(n_train):
-            batch = prefetcher.get()
+        try:
+            for _ in range(n_train):
+                batch = prefetcher.get()
 
-            # train_step now returns detached states, no redundant forward pass
-            wm_losses, wm_info = wm_trainer.train_step(batch)
+                wm_losses, wm_info = wm_trainer.train_step(batch)
 
-            ac_losses = ac_trainer.train_step(
-                wm_info["h_seq"], wm_info["z_seq"], dones=wm_info.get("dones")
-            )
+                ac_losses = ac_trainer.train_step(
+                    wm_info["h_seq"], wm_info["z_seq"], dones=wm_info.get("dones")
+                )
 
-            all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
-                          **{f"ac/{k}": v for k, v in ac_losses.items()}}
-            logger.log_step(all_losses, step=global_step)
-
-        prefetcher.stop()
+                all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
+                              **{f"ac/{k}": v for k, v in ac_losses.items()}}
+                logger.log_step(all_losses, step=global_step)
+        except Exception as e:
+            print(f"Training error at step {global_step}: {e}")
+            print("Clearing CUDA cache and continuing...")
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        finally:
+            prefetcher.stop()
 
         # ── Log ──
         if ep_rewards:
@@ -305,6 +339,7 @@ def main():
             ckpt_path = ckpt_dir / f"step_{global_step}.pt"
             torch.save({
                 "global_step": global_step,
+                "episode_count": episode_count,
                 "world_model": wm.state_dict(),
                 "actor": actor.state_dict(),
                 "critic": critic.state_dict(),

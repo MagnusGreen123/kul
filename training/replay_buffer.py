@@ -169,16 +169,24 @@ class AsyncBatchPrefetcher:
             except self._queue_mod.Full:
                 continue  # Queue full, just retry
             except Exception as e:
-                if self._stop.is_set():
-                    break
-                self._error = e
+                if not self._stop.is_set():
+                    self._error = e
+                break  # Stop worker on any error — don't loop and mask it
 
     def get(self):
         if self._error is not None:
             err = self._error
             self._error = None
             raise RuntimeError(f"Prefetcher worker failed: {err}") from err
-        return self.queue.get(timeout=30.0)
+        try:
+            return self.queue.get(timeout=30.0)
+        except self._queue_mod.Empty:
+            # Worker may have died while we were waiting
+            if self._error is not None:
+                err = self._error
+                self._error = None
+                raise RuntimeError(f"Prefetcher worker failed: {err}") from err
+            raise
 
     def stop(self):
         self._stop.set()

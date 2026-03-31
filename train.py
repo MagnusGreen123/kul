@@ -235,16 +235,21 @@ def main():
         if ckpt_path is not None:
             print(f"Resuming from {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            wm.load_state_dict(ckpt["world_model"])
-            actor.load_state_dict(ckpt["actor"])
-            critic.load_state_dict(ckpt["critic"])
-            ac_trainer.target_critic.load_state_dict(ckpt["target_critic"])
-            wm_trainer.optimizer.load_state_dict(ckpt["wm_optimizer"])
-            ac_trainer.actor_opt.load_state_dict(ckpt["actor_optimizer"])
-            ac_trainer.critic_opt.load_state_dict(ckpt["critic_optimizer"])
-            global_step = ckpt["global_step"]
-            episode_count = ckpt.get("episode_count", 0)
-            print(f"Resumed at step {global_step}, episode {episode_count}")
+            try:
+                wm.load_state_dict(ckpt["world_model"])
+                actor.load_state_dict(ckpt["actor"])
+                critic.load_state_dict(ckpt["critic"])
+                ac_trainer.target_critic.load_state_dict(ckpt["target_critic"])
+                wm_trainer.optimizer.load_state_dict(ckpt["wm_optimizer"])
+                ac_trainer.actor_opt.load_state_dict(ckpt["actor_optimizer"])
+                ac_trainer.critic_opt.load_state_dict(ckpt["critic_optimizer"])
+                global_step = ckpt["global_step"]
+                episode_count = ckpt.get("episode_count", 0)
+                print(f"Resumed at step {global_step}, episode {episode_count}")
+            except RuntimeError as e:
+                print(f"Checkpoint incompatible, starting fresh: {e}")
+                global_step = 0
+                episode_count = 0
             del ckpt
             if device.type == "cuda":
                 torch.cuda.empty_cache()

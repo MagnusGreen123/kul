@@ -14,7 +14,7 @@ mlp_units: 400
 # Training
 kl_weight: 0.1
 kl_balance: 0.8
-free_bits: 0.0             # disabled — was 0.1 but KL sat below threshold, zeroing all KL gradients
+free_bits: 1.0             # DreamerV3 default — prevents KL collapse (clamp is on dim-sum, not per-dim)
 use_symlog: true
 horizon: 15
 gamma: 0.997

@@ -4,6 +4,8 @@ Usage: python train.py --config configs/pong.yaml
 """
 
 import argparse
+import concurrent.futures
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +42,7 @@ class ParallelCollector:
         self.rssm = rssm
         self.device = device
         self.act_dim = act_dim
+        self._step_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         # Per-env state
         self.h = None
@@ -110,7 +113,15 @@ class ParallelCollector:
 
             # Step all envs
             for i in range(self.n_envs):
-                obs, reward, terminated, truncated, _ = self.envs[i].step(int(action_indices[i]))
+                try:
+                    future = self._step_executor.submit(
+                        self.envs[i].step, int(action_indices[i])
+                    )
+                    obs, reward, terminated, truncated, _ = future.result(timeout=60.0)
+                except (concurrent.futures.TimeoutError, TimeoutError):
+                    print(f"Env {i} hung on step(), resetting...")
+                    self._reset_env(i)
+                    continue
                 done = terminated or truncated
 
                 self._episode_data[i]["obs"].append(self._obs[i])
@@ -269,26 +280,35 @@ def main():
     # ── Logger ──
     logger = Logger(cfg, use_wandb=cfg.get("use_wandb", False))
 
+    collect_per_step = cfg.get("collect_per_step", 1000)  # env steps between training
+
     # ── Prefill ──
-    print(f"Prefilling {cfg['prefill_steps']} steps with random actions ({n_envs} envs)...")
-    prefill_steps = 0
-    while prefill_steps < cfg["prefill_steps"]:
-        episodes, steps = collector.collect_steps(
-            min(cfg["prefill_steps"] - prefill_steps + 2000, cfg["prefill_steps"]),
-            random=True,
-        )
+    if args.resume and global_step > 0:
+        print(f"Resume mode: collecting {collect_per_step} warmup steps with learned policy...")
+        episodes, steps = collector.collect_steps(collect_per_step, random=False)
         for obs, actions, rewards, dones in episodes:
             buffer.add_episode(obs, actions, rewards, dones)
-        prefill_steps += steps
-    # Also flush any in-progress episodes long enough to use
-    for obs, actions, rewards, dones in collector.flush_partial_episodes(cfg["batch_length"]):
-        buffer.add_episode(obs, actions, rewards, dones)
-    collector._reset_all()
-    print(f"Prefilled {prefill_steps} steps in {len(buffer)} episodes")
+        for obs, actions, rewards, dones in collector.flush_partial_episodes(cfg["batch_length"]):
+            buffer.add_episode(obs, actions, rewards, dones)
+        print(f"Warmup done: {steps} steps, {len(buffer)} episodes in buffer")
+    else:
+        print(f"Prefilling {cfg['prefill_steps']} steps with random actions ({n_envs} envs)...")
+        prefill_steps = 0
+        while prefill_steps < cfg["prefill_steps"]:
+            episodes, steps = collector.collect_steps(
+                min(cfg["prefill_steps"] - prefill_steps + 2000, cfg["prefill_steps"]),
+                random=True,
+            )
+            for obs, actions, rewards, dones in episodes:
+                buffer.add_episode(obs, actions, rewards, dones)
+            prefill_steps += steps
+        for obs, actions, rewards, dones in collector.flush_partial_episodes(cfg["batch_length"]):
+            buffer.add_episode(obs, actions, rewards, dones)
+        collector._reset_all()
+        print(f"Prefilled {prefill_steps} steps in {len(buffer)} episodes")
 
     # ── Main loop ──
     total_steps = cfg["total_steps"]
-    collect_per_step = cfg.get("collect_per_step", 1000)  # env steps between training
     train_ratio = cfg.get("train_ratio", 1.0)  # gradient steps per env step
 
     while global_step < total_steps:
@@ -308,6 +328,7 @@ def main():
         prefetcher = AsyncBatchPrefetcher(buffer, cfg["batch_size"], act_dim, device)
 
         try:
+            accumulated = {}
             for _ in range(n_train):
                 batch = prefetcher.get()
 
@@ -319,12 +340,16 @@ def main():
 
                 all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
                               **{f"ac/{k}": v for k, v in ac_losses.items()}}
-                logger.log_step(all_losses, step=global_step)
-        except Exception as e:
-            print(f"Training error at step {global_step}: {e}")
+                for k, v in all_losses.items():
+                    accumulated.setdefault(k, []).append(v)
+
+            avg_losses = {k: sum(v) / len(v) for k, v in accumulated.items()}
+            logger.log_step(avg_losses, step=global_step)
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"CUDA OOM at step {global_step}: {e}")
+            traceback.print_exc()
             print("Clearing CUDA cache and continuing...")
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
         finally:
             prefetcher.stop()
 
@@ -384,7 +409,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import traceback
     try:
         main()
     except Exception as e:

@@ -114,16 +114,10 @@ class EpisodeReplayBuffer:
         # Decompress uint8 obs to float32 [-0.5, 0.5]
         obs_np = np.stack(obs_list).astype(np.float32) / 255.0 - 0.5
 
-        if device.type == "cuda":
-            obs_t = torch.from_numpy(obs_np).pin_memory().to(device, non_blocking=True)
-            act_t = torch.from_numpy(np.stack(act_list)).pin_memory().to(device, non_blocking=True)
-            rew_t = torch.from_numpy(np.stack(rew_list)).pin_memory().to(device, non_blocking=True)
-            done_t = torch.from_numpy(np.stack(done_list)).pin_memory().to(device, non_blocking=True)
-        else:
-            obs_t = torch.from_numpy(obs_np)
-            act_t = torch.from_numpy(np.stack(act_list).copy())
-            rew_t = torch.from_numpy(np.stack(rew_list).copy())
-            done_t = torch.from_numpy(np.stack(done_list).copy())
+        obs_t = torch.from_numpy(obs_np).to(device)
+        act_t = torch.from_numpy(np.stack(act_list)).to(device)
+        rew_t = torch.from_numpy(np.stack(rew_list)).to(device)
+        done_t = torch.from_numpy(np.stack(done_list)).to(device)
 
         return {"obs": obs_t, "action": act_t, "reward": rew_t, "done": done_t}
 

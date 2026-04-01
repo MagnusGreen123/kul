@@ -167,20 +167,24 @@ class AsyncBatchPrefetcher:
                     self._error = e
                 break  # Stop worker on any error — don't loop and mask it
 
-    def get(self):
-        if self._error is not None:
-            err = self._error
-            self._error = None
-            raise RuntimeError(f"Prefetcher worker failed: {err}") from err
-        try:
-            return self.queue.get(timeout=30.0)
-        except self._queue_mod.Empty:
-            # Worker may have died while we were waiting
+    def get(self, retries: int = 5, timeout: float = 60.0):
+        for attempt in range(retries):
             if self._error is not None:
                 err = self._error
                 self._error = None
                 raise RuntimeError(f"Prefetcher worker failed: {err}") from err
-            raise
+            try:
+                return self.queue.get(timeout=timeout)
+            except self._queue_mod.Empty:
+                # Worker may have died while we were waiting
+                if self._error is not None:
+                    err = self._error
+                    self._error = None
+                    raise RuntimeError(f"Prefetcher worker failed: {err}") from err
+                if attempt < retries - 1:
+                    print(f"Prefetcher slow (attempt {attempt + 1}/{retries}), retrying...")
+                    continue
+                raise
 
     def stop(self):
         self._stop.set()

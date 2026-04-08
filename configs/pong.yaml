@@ -47,4 +47,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "v14-fix-hang-kl"
+run_name: "v15-full-ram"

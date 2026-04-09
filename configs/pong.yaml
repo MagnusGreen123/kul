@@ -15,6 +15,7 @@ mlp_units: 400
 kl_weight: 0.1
 kl_balance: 0.8
 free_bits: 1.0             # DreamerV3 default — prevents KL collapse (clamp is on dim-sum, not per-dim)
+recon_weight: 10.0         # v16: upweight recon so it competes with kl*kl ≈ 0.14 (was 1.0, recon_loss ≈ 0.0002 → no gradient pressure → decoder collapsed to mean-image)
 use_symlog: true
 horizon: 15
 gamma: 0.997
@@ -38,7 +39,7 @@ prefill_steps: 10000
 total_steps: 500000       # 500k is enough to see learning
 checkpoint_every: 50000
 log_every: 4000
-eval_every: 50000
+eval_every: 20000         # v16: more frequent recon viz so we can kill early if decoder still collapses
 
 # Buffer — capped by total transitions, not episode count.
 # 2M steps * ~16 KB/step (uint8 obs) ≈ 32 GB RAM, safe for 96 GB machine.
@@ -47,4 +48,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "v15-full-ram"
+run_name: "v16-decoder-fix"

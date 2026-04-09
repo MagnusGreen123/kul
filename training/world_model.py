@@ -46,24 +46,21 @@ class WorldModel(nn.Module):
         self.reward_pred = RewardPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_dim, units=mlp_units)
         self.cont_pred = ContPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_dim, units=mlp_units)
 
-        # Bottleneck h for decoder: project h down to stoch_dim so that
-        # z (stoch_dim) and h_proj (stoch_dim) are equal-sized inputs.
-        # This prevents the decoder from ignoring z in favor of h.
-        # h keeps full hidden_dim for RSSM, reward predictor, and actor-critic.
-        decoder_h_dim = cfg.get("decoder_h_dim", stoch_dim)
-        self._decoder_h_proj = nn.Linear(hidden_dim, decoder_h_dim)
-        self.decoder = ConvDecoder(latent_dim=decoder_h_dim + stoch_dim, out_channels=obs_channels, depth=depth)
+        # Decoder takes full (h, z). The 32d h-bottleneck used in v6-v15
+        # caused the decoder to collapse to a constant mean-image output
+        # (no paddle/ball reconstruction). DreamerV3 uses the full
+        # deterministic state as decoder input; so do we.
+        self.decoder = ConvDecoder(latent_dim=hidden_dim + stoch_dim, out_channels=obs_channels, depth=depth)
 
-        self._decoder_h_dim = decoder_h_dim
         self.kl_weight = cfg.get("kl_weight", 1.0)
         self.kl_balance = cfg.get("kl_balance", 0.8)
         self.free_bits = cfg.get("free_bits", 1.0)
         self.use_symlog = cfg.get("use_symlog", True)
+        self.recon_weight = cfg.get("recon_weight", 1.0)
 
     def decode(self, h, z):
-        """Decode from (h, z) using h bottleneck projection."""
-        h_proj = self._decoder_h_proj(h)
-        return self.decoder(torch.cat([h_proj, z], dim=-1))
+        """Decode from (h, z)."""
+        return self.decoder(torch.cat([h, z], dim=-1))
 
     def forward(self, obs, actions, rewards, dones=None):
         """Forward pass for training.
@@ -85,7 +82,7 @@ class WorldModel(nn.Module):
         # Run RSSM
         h_seq, z_seq, priors, posteriors = self.rssm.observe_sequence(embeds, actions)
 
-        # Decode from (h, z) via h bottleneck
+        # Decode from (h, z)
         recon = self.decode(h_seq, z_seq)  # (B, T, C, H, W)
 
         # Predict rewards
@@ -114,7 +111,7 @@ class WorldModel(nn.Module):
         else:
             cont_loss = torch.zeros(1, device=obs.device)
 
-        total_loss = recon_loss + self.kl_weight * kl + reward_loss + cont_loss
+        total_loss = self.recon_weight * recon_loss + self.kl_weight * kl + reward_loss + cont_loss
 
         losses = {
             "total": total_loss,

@@ -235,8 +235,8 @@ def main():
     # ── Dirs ──
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
-    runs_dir = Path("runs")
-    runs_dir.mkdir(exist_ok=True)
+    runs_dir = Path("runs") / cfg["run_name"]
+    runs_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Resume from checkpoint ──
     global_step = 0

@@ -48,4 +48,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "v16-decoder-fix"
+run_name: "v17-huber-tanh"

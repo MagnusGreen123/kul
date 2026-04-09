@@ -92,8 +92,11 @@ class WorldModel(nn.Module):
         cont_logit = self.cont_pred(h_seq, z_seq)  # (B, T)
 
         # ── Losses ──
-        # Reconstruction loss (MSE on pixels)
-        recon_loss = F.mse_loss(recon, obs)
+        # Reconstruction loss (Huber/smooth_l1 on pixels)
+        # v17: MSE collapsed to mean-image in v15/v16 because gradient -> 0 as error -> 0.
+        # smooth_l1 has constant ±1 gradient for |err| > 1 and linear falloff below,
+        # keeping pressure on rare-but-important pixel differences (ball, paddles).
+        recon_loss = F.smooth_l1_loss(recon, obs)
 
         # KL divergence with balancing and free bits
         kl, kl_raw = kl_loss(priors, posteriors, free_bits=self.free_bits, balance=self.kl_balance)

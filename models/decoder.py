@@ -30,6 +30,7 @@ class ConvDecoder(nn.Module):
             nn.ConvTranspose2d(depth * 2, depth, 4, stride=2, padding=1),      # -> (32, 32, 32)
             nn.ELU(),
             nn.ConvTranspose2d(depth, out_channels, 4, stride=2, padding=1),   # -> (C, 64, 64)
+            nn.Tanh(),  # v17: saturate to [-1, 1], then ×0.5 below -> [-0.5, 0.5] matches obs range
         )
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
@@ -47,7 +48,7 @@ class ConvDecoder(nn.Module):
 
         x = self.fc(latent)
         x = rearrange(x, "b (c h w) -> b c h w", c=self.depth * 8, h=4, w=4)
-        x = self.deconvs(x)
+        x = self.deconvs(x) * 0.5  # tanh output [-1, 1] -> obs range [-0.5, 0.5]
 
         if has_time:
             x = rearrange(x, "(b t) c h w -> b t c h w", b=B, t=T)

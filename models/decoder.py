@@ -19,7 +19,11 @@ class ConvDecoder(nn.Module):
 
     def __init__(self, latent_dim: int = 512, out_channels: int = 4, depth: int = 32):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, depth * 8 * 4 * 4)
+        # bias=False prevents the decoder from encoding a "mean image" in the
+        # bias alone (6144-dim bias = 384ch × 4×4 spatial → upsampled to 64×64).
+        # Without bias, the decoder MUST use its (h, z) input to produce any
+        # spatially structured output. Deconv biases are per-channel only.
+        self.fc = nn.Linear(latent_dim, depth * 8 * 4 * 4, bias=False)
         self.depth = depth
 
         self.deconvs = nn.Sequential(

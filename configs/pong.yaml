@@ -12,10 +12,11 @@ cnn_depth: 48             # between 32 and 64
 mlp_units: 400
 
 # Training
-kl_weight: 0.1
+kl_weight: 0.01            # v18: lowered 10× so KL doesn't resist encoder encoding detail into z
 kl_balance: 0.8
 free_bits: 1.0             # DreamerV3 default — prevents KL collapse (clamp is on dim-sum, not per-dim)
-recon_weight: 10.0         # v16: upweight recon so it competes with kl*kl ≈ 0.14 (was 1.0, recon_loss ≈ 0.0002 → no gradient pressure → decoder collapsed to mean-image)
+recon_weight: 100.0        # v18: L1 loss ≈ 0.035 at mean-image → 100×0.035=3.5 dominates kl (0.01×1=0.01)
+reward_weight: 10.0        # v18: upweight sparse reward signal (only ~0.1% of timesteps are non-zero)
 use_symlog: true
 horizon: 15
 gamma: 0.997
@@ -48,4 +49,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "v17-huber-tanh"
+run_name: "v18-l1-lowkl"

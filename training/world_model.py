@@ -57,6 +57,7 @@ class WorldModel(nn.Module):
         self.free_bits = cfg.get("free_bits", 1.0)
         self.use_symlog = cfg.get("use_symlog", True)
         self.recon_weight = cfg.get("recon_weight", 1.0)
+        self.reward_weight = cfg.get("reward_weight", 1.0)
 
     def decode(self, h, z):
         """Decode from (h, z)."""
@@ -92,20 +93,24 @@ class WorldModel(nn.Module):
         cont_logit = self.cont_pred(h_seq, z_seq)  # (B, T)
 
         # ── Losses ──
-        # Reconstruction loss (Huber/smooth_l1 on pixels)
-        # v17: MSE collapsed to mean-image in v15/v16 because gradient -> 0 as error -> 0.
-        # smooth_l1 has constant ±1 gradient for |err| > 1 and linear falloff below,
-        # keeping pressure on rare-but-important pixel differences (ball, paddles).
-        recon_loss = F.smooth_l1_loss(recon, obs)
+        # Reconstruction loss (L1 on pixels)
+        # v18: L1 has constant gradient ±1/N for ALL error magnitudes.
+        # MSE/smooth_l1(β=1) gradient → 0 as error → 0, letting the decoder
+        # sit at mean-image without pressure to reconstruct ball/paddles.
+        recon_loss = F.l1_loss(recon, obs)
 
         # KL divergence with balancing and free bits
         kl, kl_raw = kl_loss(priors, posteriors, free_bits=self.free_bits, balance=self.kl_balance)
 
-        # Reward loss (symlog targets for stability)
+        # Reward loss — targets are shifted by 1 step (arrival reward alignment).
+        # reward_pred(h[t], z[t]) should predict the reward for arriving at state t,
+        # which is rewards[t-1] (the reward from the action that led to this state).
+        # At t=0 there is no prior action, so arrival reward = 0.
+        shifted_rewards = torch.cat([torch.zeros_like(rewards[:, :1]), rewards[:, :-1]], dim=1)
         if self.use_symlog:
-            reward_loss = F.mse_loss(reward_pred, symlog(rewards))
+            reward_loss = F.mse_loss(reward_pred, symlog(shifted_rewards))
         else:
-            reward_loss = F.mse_loss(reward_pred, rewards)
+            reward_loss = F.mse_loss(reward_pred, shifted_rewards)
 
         # Continuation loss (BCE on logits vs 1 - done)
         if dones is not None:
@@ -114,7 +119,8 @@ class WorldModel(nn.Module):
         else:
             cont_loss = torch.zeros(1, device=obs.device)
 
-        total_loss = self.recon_weight * recon_loss + self.kl_weight * kl + reward_loss + cont_loss
+        total_loss = (self.recon_weight * recon_loss + self.kl_weight * kl
+                      + self.reward_weight * reward_loss + cont_loss)
 
         losses = {
             "total": total_loss,

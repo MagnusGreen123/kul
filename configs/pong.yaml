@@ -5,16 +5,18 @@ seed: 42
 # RSSM dimensions — medium size, fast per step
 embed_dim: 512
 hidden_dim: 256
-stoch_dim: 32
+stoch_dim: 32              # number of categorical distributions
+n_classes: 32              # classes per categorical (flat z = 32×32 = 1024)
 act_dim: 6
 obs_channels: 4
-cnn_depth: 48             # between 32 and 64
+cnn_depth: 48              # between 32 and 64
 mlp_units: 400
+unimix: 0.01               # uniform mixing in categorical probs (prevents collapse)
 
 # Training
 kl_weight: 0.01            # v18: lowered 10× so KL doesn't resist encoder encoding detail into z
 kl_balance: 0.8
-free_bits: 1.0             # DreamerV3 default — prevents KL collapse (clamp is on dim-sum, not per-dim)
+free_bits: 1.0             # DreamerV3 default — minimum total KL (nats) before gradient flows
 recon_weight: 100.0        # v18: L1 loss ≈ 0.035 at mean-image → 100×0.035=3.5 dominates kl (0.01×1=0.01)
 reward_weight: 10.0        # v18: upweight sparse reward signal (only ~0.1% of timesteps are non-zero)
 use_symlog: true

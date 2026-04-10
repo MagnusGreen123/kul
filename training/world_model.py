@@ -36,25 +36,31 @@ class WorldModel(nn.Module):
         embed_dim = cfg.get("embed_dim", 512)
         hidden_dim = cfg.get("hidden_dim", 256)
         stoch_dim = cfg.get("stoch_dim", 32)
+        n_classes = cfg.get("n_classes", 32)
         act_dim = cfg.get("act_dim", 4)
         depth = cfg.get("cnn_depth", 32)
+        unimix = cfg.get("unimix", 0.01)
+
+        # Flat z dimension: stoch_dim * n_classes (e.g. 32*32 = 1024 one-hot)
+        stoch_feat_dim = stoch_dim * n_classes
 
         self.encoder = ConvEncoder(in_channels=obs_channels, latent_dim=embed_dim, depth=depth)
         self.rssm = RSSM(embed_dim=embed_dim, stoch_dim=stoch_dim,
-                         hidden_dim=hidden_dim, act_dim=act_dim)
+                         n_classes=n_classes, hidden_dim=hidden_dim,
+                         act_dim=act_dim, unimix=unimix)
         mlp_units = cfg.get("mlp_units", 256)
-        self.reward_pred = RewardPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_dim, units=mlp_units)
-        self.cont_pred = ContPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_dim, units=mlp_units)
+        self.reward_pred = RewardPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_feat_dim, units=mlp_units)
+        self.cont_pred = ContPredictor(hidden_dim=hidden_dim, stoch_dim=stoch_feat_dim, units=mlp_units)
 
-        # Decoder takes full (h, z). The 32d h-bottleneck used in v6-v15
-        # caused the decoder to collapse to a constant mean-image output
-        # (no paddle/ball reconstruction). DreamerV3 uses the full
-        # deterministic state as decoder input; so do we.
-        self.decoder = ConvDecoder(latent_dim=hidden_dim + stoch_dim, out_channels=obs_channels, depth=depth)
+        # Decoder takes (h, z_flat). With categorical latents z is 1024-dim
+        # one-hot — 80% of decoder input, making it impossible to ignore
+        # (vs 11% with old 32-dim Gaussian that caused posterior collapse).
+        self.decoder = ConvDecoder(latent_dim=hidden_dim + stoch_feat_dim, out_channels=obs_channels, depth=depth)
 
         self.kl_weight = cfg.get("kl_weight", 1.0)
         self.kl_balance = cfg.get("kl_balance", 0.8)
         self.free_bits = cfg.get("free_bits", 1.0)
+        self.unimix = unimix
         self.use_symlog = cfg.get("use_symlog", True)
         self.recon_weight = cfg.get("recon_weight", 1.0)
         self.reward_weight = cfg.get("reward_weight", 1.0)
@@ -81,7 +87,7 @@ class WorldModel(nn.Module):
         embeds = self.encoder(obs)  # (B, T, embed_dim)
 
         # Run RSSM
-        h_seq, z_seq, priors, posteriors = self.rssm.observe_sequence(embeds, actions)
+        h_seq, z_seq, prior_logits, post_logits = self.rssm.observe_sequence(embeds, actions)
 
         # Decode from (h, z)
         recon = self.decode(h_seq, z_seq)  # (B, T, C, H, W)
@@ -99,8 +105,9 @@ class WorldModel(nn.Module):
         # sit at mean-image without pressure to reconstruct ball/paddles.
         recon_loss = F.l1_loss(recon, obs)
 
-        # KL divergence with balancing and free bits
-        kl, kl_raw = kl_loss(priors, posteriors, free_bits=self.free_bits, balance=self.kl_balance)
+        # KL divergence with balancing and free bits (categorical)
+        kl, kl_raw = kl_loss(post_logits, prior_logits, free_bits=self.free_bits,
+                             balance=self.kl_balance, unimix=self.unimix)
 
         # Reward loss — targets are shifted by 1 step (arrival reward alignment).
         # reward_pred(h[t], z[t]) should predict the reward for arriving at state t,
@@ -196,6 +203,7 @@ if __name__ == "__main__":
         "embed_dim": 512,
         "hidden_dim": 256,
         "stoch_dim": 32,
+        "n_classes": 32,
         "act_dim": 4,
         "cnn_depth": 32,
         "kl_weight": 1.0,

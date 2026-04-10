@@ -204,16 +204,18 @@ def main():
     # ── Models ──
     wm = WorldModel(cfg).to(device)
     mlp_units = cfg.get("mlp_units", 512)
+    # Categorical latents: flat z dim = stoch_dim * n_classes (e.g. 32*32=1024)
+    stoch_feat_dim = cfg["stoch_dim"] * cfg.get("n_classes", 32)
     actor = Actor(
         hidden_dim=cfg["hidden_dim"],
-        stoch_dim=cfg["stoch_dim"],
+        stoch_dim=stoch_feat_dim,
         act_dim=act_dim,
         units=mlp_units,
         discrete=True,
     ).to(device)
     critic = Critic(
         hidden_dim=cfg["hidden_dim"],
-        stoch_dim=cfg["stoch_dim"],
+        stoch_dim=stoch_feat_dim,
         units=mlp_units,
     ).to(device)
 

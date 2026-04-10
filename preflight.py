@@ -101,9 +101,9 @@ def test_model_construction(cfg, device, result):
         wm = WorldModel(cfg).to(device)
         act_dim = cfg["act_dim"]
         mlp_units = cfg.get("mlp_units", 512)
-        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                       act_dim=act_dim, units=mlp_units, discrete=True).to(device)
-        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                         units=mlp_units).to(device)
 
         # Forward pass with actual batch dimensions
@@ -293,9 +293,9 @@ def test_full_training_iterations(cfg, device, result):
         wm = WorldModel(cfg).to(device)
         act_dim = cfg["act_dim"]
         mlp_units = cfg.get("mlp_units", 512)
-        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                       act_dim=act_dim, units=mlp_units, discrete=True).to(device)
-        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                         units=mlp_units).to(device)
 
         torch.backends.cudnn.benchmark = True
@@ -370,9 +370,9 @@ def test_memory_leak(cfg, device, result):
         wm = WorldModel(cfg).to(device)
         act_dim = cfg["act_dim"]
         mlp_units = cfg.get("mlp_units", 512)
-        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                       act_dim=act_dim, units=mlp_units, discrete=True).to(device)
-        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                         units=mlp_units).to(device)
 
         wm_trainer = WorldModelTrainer(wm, cfg, device)
@@ -450,9 +450,9 @@ def test_checkpoint_roundtrip(cfg, device, result):
         wm = WorldModel(cfg).to(device)
         act_dim = cfg["act_dim"]
         mlp_units = cfg.get("mlp_units", 512)
-        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                       act_dim=act_dim, units=mlp_units, discrete=True).to(device)
-        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                         units=mlp_units).to(device)
 
         wm_trainer = WorldModelTrainer(wm, cfg, device)
@@ -484,9 +484,9 @@ def test_checkpoint_roundtrip(cfg, device, result):
 
         # Load into fresh models
         wm2 = WorldModel(cfg).to(device)
-        actor2 = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        actor2 = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                        act_dim=act_dim, units=mlp_units, discrete=True).to(device)
-        critic2 = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        critic2 = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                          units=mlp_units).to(device)
 
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
@@ -518,9 +518,9 @@ def test_numerical_stability(cfg, device, result):
         wm = WorldModel(cfg).to(device)
         act_dim = cfg["act_dim"]
         mlp_units = cfg.get("mlp_units", 512)
-        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                       act_dim=act_dim, units=mlp_units, discrete=True).to(device)
-        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+        critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                         units=mlp_units).to(device)
 
         wm_trainer = WorldModelTrainer(wm, cfg, device)
@@ -609,9 +609,9 @@ def main():
     # Test 2: Gradient health
     wm = WorldModel(cfg).to(device)
     mlp_units = cfg.get("mlp_units", 512)
-    actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+    actor = Actor(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                   act_dim=cfg["act_dim"], units=mlp_units, discrete=True).to(device)
-    critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"],
+    critic = Critic(hidden_dim=cfg["hidden_dim"], stoch_dim=cfg["stoch_dim"] * cfg.get("n_classes", 32),
                     units=mlp_units).to(device)
     test_gradient_health(wm, actor, critic, cfg, device, result)
     del wm, actor, critic

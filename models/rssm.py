@@ -32,9 +32,12 @@ class RSSM(nn.Module):
         self.unimix = unimix
         self.stoch_feat_dim = stoch_dim * n_classes  # flat z dimension (e.g. 32*32=1024)
 
-        # h_{t} = GRU(h_{t-1}, [z_{t-1}, a_{t-1}])
+        # h_{t} = LayerNorm(GRU(h_{t-1}, [z_{t-1}, a_{t-1}]))
+        # LayerNorm after GRU is critical (DreamerV3): without it, h grows
+        # to arbitrary magnitude and drowns out z in the decoder input.
         self.gru_input = nn.Linear(self.stoch_feat_dim + act_dim, hidden_dim)
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.gru_norm = nn.LayerNorm(hidden_dim)
 
         # Prior p(z_t | h_t): predicts z from h alone (imagination)
         self.prior_net = nn.Sequential(
@@ -96,7 +99,7 @@ class RSSM(nn.Module):
         # Deterministic step
         gru_in = self.gru_input(torch.cat([prev_z, prev_action], dim=-1))
         gru_in = F.elu(gru_in)
-        h = self.gru(gru_in, prev_h)
+        h = self.gru_norm(self.gru(gru_in, prev_h))
 
         # Prior p(z|h)
         prior_raw = self.prior_net(h)
@@ -119,7 +122,7 @@ class RSSM(nn.Module):
         """
         gru_in = self.gru_input(torch.cat([prev_z, prev_action], dim=-1))
         gru_in = F.elu(gru_in)
-        h = self.gru(gru_in, prev_h)
+        h = self.gru_norm(self.gru(gru_in, prev_h))
 
         prior_raw = self.prior_net(h)
         prior_logits = prior_raw.unflatten(-1, (self.stoch_dim, self.n_classes))

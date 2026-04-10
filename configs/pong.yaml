@@ -16,7 +16,7 @@ unimix: 0.01               # uniform mixing in categorical probs (prevents colla
 # Training
 kl_weight: 0.01            # v18: lowered 10× so KL doesn't resist encoder encoding detail into z
 kl_balance: 0.8
-free_bits: 1.0             # DreamerV3 default — minimum total KL (nats) before gradient flows
+free_bits: 0.1             # lowered from 1.0 — v19 had kl_raw=0.12 (below 1.0), so KL gradient was zero
 recon_weight: 100.0        # v18: L1 loss ≈ 0.035 at mean-image → 100×0.035=3.5 dominates kl (0.01×1=0.01)
 reward_weight: 10.0        # v18: upweight sparse reward signal (only ~0.1% of timesteps are non-zero)
 use_symlog: true

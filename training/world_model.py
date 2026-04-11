@@ -68,8 +68,9 @@ class WorldModel(nn.Module):
         self.reward_weight = cfg.get("reward_weight", 1.0)
 
     def decode(self, h, z):
-        """Decode from (h, z)."""
-        return self.decoder(torch.cat([h, z], dim=-1))
+        """Decode from (h, z). Returns only the mean (for viz / ablation)."""
+        mean, _ = self.decoder(torch.cat([h, z], dim=-1))
+        return mean
 
     def forward(self, obs, actions, rewards, dones=None):
         """Forward pass for training.
@@ -91,8 +92,8 @@ class WorldModel(nn.Module):
         # Run RSSM
         h_seq, z_seq, prior_logits, post_logits = self.rssm.observe_sequence(embeds, actions)
 
-        # Decode from (h, z)
-        recon = self.decode(h_seq, z_seq)  # (B, T, C, H, W)
+        # Decode from (h, z) — returns both mean and per-pixel log_std
+        recon, recon_log_std = self.decoder(torch.cat([h_seq, z_seq], dim=-1))
 
         # Predict rewards
         reward_pred = self.reward_pred(h_seq, z_seq)  # (B, T)
@@ -101,18 +102,16 @@ class WorldModel(nn.Module):
         cont_logit = self.cont_pred(h_seq, z_seq)  # (B, T)
 
         # ── Losses ──
-        # v22: Gaussian NLL with learned log_std (per channel).
-        # Sum over pixels (C, H, W) → mean over batch/time. This gives the
-        # recon term a gradient magnitude that scales with image size, so
-        # it can't be drowned out by small KL/reward terms. A constant-mean
-        # decoder is heavily penalized: std must shrink to explain foreground
-        # detail, which then explodes NLL on the background that mean-image
-        # got "for free" under L1/MSE-mean.
-        log_std = torch.clamp(self.decoder.log_std, min=-5.0, max=2.0)  # (1, C, 1, 1)
-        log_std_b = log_std.unsqueeze(1)                                 # (1, 1, C, 1, 1)
-        inv_var = torch.exp(-2.0 * log_std_b)
+        # v23: Gaussian NLL with PER-PIXEL learned log_std.
+        # The decoder outputs a per-pixel mean and log_std. Background pixels
+        # can converge to very low σ (big NLL savings), and ball/paddle pixels
+        # must also be correctly predicted to get the same savings — "giving
+        # up" with high σ gives only ~0.7 per pixel vs ~-3.7 for correct
+        # prediction at σ=0.01. This creates real gradient pressure on the
+        # small moving objects that shared-σ v22 could not learn.
+        inv_var = torch.exp(-2.0 * recon_log_std)
         sq_err = (obs - recon) ** 2
-        nll = 0.5 * (sq_err * inv_var + 2.0 * log_std_b + math.log(2.0 * math.pi))
+        nll = 0.5 * (sq_err * inv_var + 2.0 * recon_log_std + math.log(2.0 * math.pi))
         recon_loss = nll.sum(dim=(2, 3, 4)).mean()
 
         # KL divergence with balancing and free bits (categorical)
@@ -149,6 +148,7 @@ class WorldModel(nn.Module):
             "h_seq": h_seq.detach(),
             "z_seq": z_seq.detach(),
             "recon": recon.detach(),
+            "recon_log_std": recon_log_std.detach(),
             "dones": dones,  # pass through for AC terminal filtering
         }
         return losses, info

@@ -4,6 +4,8 @@ Losses: reconstruction + KL divergence (with balancing) + reward prediction.
 Supports mixed precision training via torch.cuda.amp.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -99,25 +101,31 @@ class WorldModel(nn.Module):
         cont_logit = self.cont_pred(h_seq, z_seq)  # (B, T)
 
         # ── Losses ──
-        # Reconstruction loss (L1 on pixels)
-        # v18: L1 has constant gradient ±1/N for ALL error magnitudes.
-        # MSE/smooth_l1(β=1) gradient → 0 as error → 0, letting the decoder
-        # sit at mean-image without pressure to reconstruct ball/paddles.
-        recon_loss = F.l1_loss(recon, obs)
+        # v22: Gaussian NLL with learned log_std (per channel).
+        # Sum over pixels (C, H, W) → mean over batch/time. This gives the
+        # recon term a gradient magnitude that scales with image size, so
+        # it can't be drowned out by small KL/reward terms. A constant-mean
+        # decoder is heavily penalized: std must shrink to explain foreground
+        # detail, which then explodes NLL on the background that mean-image
+        # got "for free" under L1/MSE-mean.
+        log_std = torch.clamp(self.decoder.log_std, min=-5.0, max=2.0)  # (1, C, 1, 1)
+        log_std_b = log_std.unsqueeze(1)                                 # (1, 1, C, 1, 1)
+        inv_var = torch.exp(-2.0 * log_std_b)
+        sq_err = (obs - recon) ** 2
+        nll = 0.5 * (sq_err * inv_var + 2.0 * log_std_b + math.log(2.0 * math.pi))
+        recon_loss = nll.sum(dim=(2, 3, 4)).mean()
 
         # KL divergence with balancing and free bits (categorical)
         kl, kl_raw = kl_loss(post_logits, prior_logits, free_bits=self.free_bits,
                              balance=self.kl_balance, unimix=self.unimix)
 
         # Reward loss — targets are shifted by 1 step (arrival reward alignment).
-        # reward_pred(h[t], z[t]) should predict the reward for arriving at state t,
-        # which is rewards[t-1] (the reward from the action that led to this state).
-        # At t=0 there is no prior action, so arrival reward = 0.
+        # v22: sum over time, mean over batch. With ~30 timesteps per sequence
+        # and ~0.1% non-zero, mean-reduction diluted the ±1 gradient 1000×.
+        # Sum-over-time keeps the signal from sparse events intact.
         shifted_rewards = torch.cat([torch.zeros_like(rewards[:, :1]), rewards[:, :-1]], dim=1)
-        if self.use_symlog:
-            reward_loss = F.mse_loss(reward_pred, symlog(shifted_rewards))
-        else:
-            reward_loss = F.mse_loss(reward_pred, shifted_rewards)
+        target_reward = symlog(shifted_rewards) if self.use_symlog else shifted_rewards
+        reward_loss = F.mse_loss(reward_pred, target_reward, reduction="none").sum(dim=1).mean()
 
         # Continuation loss (BCE on logits vs 1 - done)
         if dones is not None:

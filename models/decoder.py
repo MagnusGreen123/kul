@@ -19,25 +19,24 @@ class ConvDecoder(nn.Module):
 
     def __init__(self, latent_dim: int = 512, out_channels: int = 4, depth: int = 32):
         super().__init__()
-        # bias=False prevents the decoder from encoding a "mean image" in the
-        # bias alone (6144-dim bias = 384ch × 4×4 spatial → upsampled to 64×64).
-        # Without bias, the decoder MUST use its (h, z) input to produce any
-        # spatially structured output. Deconv biases are per-channel only.
         self.fc = nn.Linear(latent_dim, depth * 8 * 4 * 4, bias=False)
         self.depth = depth
 
         self.deconvs = nn.Sequential(
-            nn.ConvTranspose2d(depth * 8, depth * 4, 4, stride=2, padding=1),  # -> (128, 8, 8)
+            nn.ConvTranspose2d(depth * 8, depth * 4, 4, stride=2, padding=1),
             nn.ELU(),
-            nn.ConvTranspose2d(depth * 4, depth * 2, 4, stride=2, padding=1),  # -> (64, 16, 16)
+            nn.ConvTranspose2d(depth * 4, depth * 2, 4, stride=2, padding=1),
             nn.ELU(),
-            nn.ConvTranspose2d(depth * 2, depth, 4, stride=2, padding=1),      # -> (32, 32, 32)
+            nn.ConvTranspose2d(depth * 2, depth, 4, stride=2, padding=1),
             nn.ELU(),
-            nn.ConvTranspose2d(depth, out_channels, 4, stride=2, padding=1),   # -> (C, 64, 64)
-            # v18: no output activation — tanh created gradient dead zones at
-            # ±0.5 (black/white pixels), preventing decoder from modifying
-            # committed pixel values. Raw output with L1 loss is stable.
+            nn.ConvTranspose2d(depth, out_channels, 4, stride=2, padding=1),
         )
+
+        # v22: learned per-channel log_std for Gaussian NLL reconstruction loss.
+        # Forces the decoder to predict uncertainty — a constant mean-image
+        # yields huge NLL on non-background pixels because std must shrink to
+        # explain the sharp paddle/ball, which then inflates background error.
+        self.log_std = nn.Parameter(torch.zeros(1, out_channels, 1, 1))
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """

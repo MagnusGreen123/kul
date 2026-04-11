@@ -47,7 +47,8 @@ def latent_to_images(decode_fn, h_seq, z_seq, denormalize: bool = True):
     return imgs
 
 
-def save_reconstruction_grid(obs, recon, save_path: str, n_frames: int = 8):
+def save_reconstruction_grid(obs, recon, save_path: str, n_frames: int = 8,
+                              start_t: int | None = None):
     """Save a grid comparing real observations with reconstructions.
 
     Args:
@@ -55,13 +56,23 @@ def save_reconstruction_grid(obs, recon, save_path: str, n_frames: int = 8):
         recon: same shape, reconstructed observations
         save_path: output file path
         n_frames: number of frames to show
+        start_t: first frame index to show. If None, centers the window so
+            we skip the post-reset dead zone in Atari envs (Pong: ~15 steps
+            with no ball on screen).
     """
     if obs.dim() == 5:
         obs = obs[0]
         recon = recon[0]
 
-    obs = obs[:n_frames, 0].cpu().numpy()      # (N, H, W) first channel
-    recon = recon[:n_frames, 0].cpu().numpy()
+    T = obs.shape[0]
+    if start_t is None:
+        start_t = max(0, (T - n_frames) // 2 + (T - n_frames) // 4)
+    end_t = min(T, start_t + n_frames)
+    start_t = max(0, end_t - n_frames)
+
+    obs = obs[start_t:end_t, 0].cpu().numpy()
+    recon = recon[start_t:end_t, 0].cpu().numpy()
+    n_frames = obs.shape[0]
 
     obs = np.clip((obs + 0.5) * 255, 0, 255).astype(np.uint8)
     recon = np.clip((recon + 0.5) * 255, 0, 255).astype(np.uint8)
@@ -69,7 +80,7 @@ def save_reconstruction_grid(obs, recon, save_path: str, n_frames: int = 8):
     fig, axes = plt.subplots(2, n_frames, figsize=(2 * n_frames, 4))
     for i in range(n_frames):
         axes[0, i].imshow(obs[i], cmap="gray", vmin=0, vmax=255)
-        axes[0, i].set_title(f"t={i}" if i == 0 else str(i))
+        axes[0, i].set_title(f"t={start_t + i}")
         axes[0, i].axis("off")
         axes[1, i].imshow(recon[i], cmap="gray", vmin=0, vmax=255)
         axes[1, i].axis("off")

@@ -73,7 +73,7 @@ def main():
     parser.add_argument("--config", default="configs/pong.yaml")
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--batch-length", type=int, default=30)
+    parser.add_argument("--batch-length", type=int, default=50)
     parser.add_argument("--out-dir", default="runs/overfit-test")
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)

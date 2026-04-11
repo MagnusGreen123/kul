@@ -22,6 +22,7 @@ kl_balance: 0.8
 free_bits: 1.0
 recon_weight: 1.0
 reward_weight: 10.0
+fg_weight: 50.0           # v24: foreground-weighted MSE — moving pixels get weight 1+fg_weight*|Δobs|
 use_symlog: true
 horizon: 15
 gamma: 0.997
@@ -54,4 +55,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "v22-nll-decoder"
+run_name: "v24-fg-weighted-mse"

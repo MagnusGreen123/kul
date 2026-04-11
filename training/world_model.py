@@ -4,8 +4,6 @@ Losses: reconstruction + KL divergence (with balancing) + reward prediction.
 Supports mixed precision training via torch.cuda.amp.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -66,11 +64,10 @@ class WorldModel(nn.Module):
         self.use_symlog = cfg.get("use_symlog", True)
         self.recon_weight = cfg.get("recon_weight", 1.0)
         self.reward_weight = cfg.get("reward_weight", 1.0)
+        self.fg_weight = cfg.get("fg_weight", 50.0)
 
     def decode(self, h, z):
-        """Decode from (h, z). Returns only the mean (for viz / ablation)."""
-        mean, _ = self.decoder(torch.cat([h, z], dim=-1))
-        return mean
+        return self.decoder(torch.cat([h, z], dim=-1))
 
     def forward(self, obs, actions, rewards, dones=None):
         """Forward pass for training.
@@ -92,27 +89,21 @@ class WorldModel(nn.Module):
         # Run RSSM
         h_seq, z_seq, prior_logits, post_logits = self.rssm.observe_sequence(embeds, actions)
 
-        # Decode from (h, z) — returns both mean and per-pixel log_std
-        recon, recon_log_std = self.decoder(torch.cat([h_seq, z_seq], dim=-1))
+        recon = self.decoder(torch.cat([h_seq, z_seq], dim=-1))
 
-        # Predict rewards
         reward_pred = self.reward_pred(h_seq, z_seq)  # (B, T)
-
-        # Predict continuation
         cont_logit = self.cont_pred(h_seq, z_seq)  # (B, T)
 
-        # ── Losses ──
-        # v23: Gaussian NLL with PER-PIXEL learned log_std.
-        # The decoder outputs a per-pixel mean and log_std. Background pixels
-        # can converge to very low σ (big NLL savings), and ball/paddle pixels
-        # must also be correctly predicted to get the same savings — "giving
-        # up" with high σ gives only ~0.7 per pixel vs ~-3.7 for correct
-        # prediction at σ=0.01. This creates real gradient pressure on the
-        # small moving objects that shared-σ v22 could not learn.
-        inv_var = torch.exp(-2.0 * recon_log_std)
+        # v24: foreground-weighted MSE. v23's per-pixel NLL let the decoder
+        # "give up" on the ball (high σ), so we force gradient onto moving
+        # pixels with a temporal-diff mask: weight = 1 + fg_weight * |Δobs|.
+        # Ball/paddle pixels (Δ≈0.5) get weight ~26, background (Δ≈0) gets 1.
+        diff = torch.zeros_like(obs)
+        diff[:, 1:] = (obs[:, 1:] - obs[:, :-1]).abs()
+        fg_mask = diff.mean(dim=2, keepdim=True)  # (B,T,1,H,W)
+        weight = 1.0 + self.fg_weight * fg_mask
         sq_err = (obs - recon) ** 2
-        nll = 0.5 * (sq_err * inv_var + 2.0 * recon_log_std + math.log(2.0 * math.pi))
-        recon_loss = nll.sum(dim=(2, 3, 4)).mean()
+        recon_loss = (sq_err * weight).sum(dim=(2, 3, 4)).mean()
 
         # KL divergence with balancing and free bits (categorical)
         kl, kl_raw = kl_loss(post_logits, prior_logits, free_bits=self.free_bits,
@@ -148,7 +139,7 @@ class WorldModel(nn.Module):
             "h_seq": h_seq.detach(),
             "z_seq": z_seq.detach(),
             "recon": recon.detach(),
-            "recon_log_std": recon_log_std.detach(),
+            "fg_mask": fg_mask.detach(),
             "dones": dones,  # pass through for AC terminal filtering
         }
         return losses, info

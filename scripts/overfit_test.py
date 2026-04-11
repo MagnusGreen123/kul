@@ -117,16 +117,16 @@ def main():
                              str(out_dir / "ground_truth.png"), n_frames=8)
 
     print(f"{'step':>5} {'recon':>12} {'kl_raw':>8} {'reward':>10} "
-          f"{'rec.std':>9} {'ls.min':>8} {'ls.mean':>8} {'ls.max':>8}")
+          f"{'rec.std':>9} {'fg.mean':>9} {'fg.max':>9}")
     for step in range(args.steps + 1):
         losses, info = trainer.train_step(batch)
 
         if step % 10 == 0:
             recon = info["recon"]
-            ls = info["recon_log_std"]
+            fg = info["fg_mask"]
             print(f"{step:5d} {losses['recon']:12.1f} {losses.get('kl_raw', 0):8.3f} "
                   f"{losses['reward']:10.4f} {recon.std().item():9.4f} "
-                  f"{ls.min().item():8.3f} {ls.mean().item():8.3f} {ls.max().item():8.3f}")
+                  f"{fg.mean().item():9.5f} {fg.max().item():9.5f}")
 
         if step % args.save_every == 0:
             save_reconstruction_grid(

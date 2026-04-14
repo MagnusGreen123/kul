@@ -73,6 +73,9 @@ class ActorCriticTrainer:
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr, eps=1e-5)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=critic_lr, eps=1e-5)
         self.max_grad_norm = cfg.get("max_grad_norm", 100.0)
+        # v2 (breakout): tighter clip on critic to contain value-target feedback
+        # loops when returns accumulate (e.g. Breakout). Default matches actor.
+        self.critic_grad_clip = cfg.get("critic_grad_clip", self.max_grad_norm)
 
         # Return normalization — EMA of 5th/95th percentiles (DreamerV3)
         self._return_ema_low = None
@@ -131,7 +134,10 @@ class ActorCriticTrainer:
             with torch.no_grad():
                 h, z, _ = self.world_model.rssm.imagine_step(h, z, action.detach())
                 reward = self.world_model.reward_pred(h, z)
-                value = self.target_critic(h, z)  # V(s_{t+1}) after action
+                # v2: critic predicts in symlog space (symmetric with reward pred);
+                # symexp to real space for lambda-return math.
+                value_out = self.target_critic(h, z)
+                value = symexp(value_out) if self.use_symlog else value_out
                 cont = torch.sigmoid(self.world_model.cont_pred(h, z))
 
             h_list.append(h)
@@ -207,13 +213,17 @@ class ActorCriticTrainer:
         actor_grad = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_opt.step()
 
-        # ── Critic loss ── targets from target_critic, train live critic
+        # ── Critic loss ── targets from target_critic, train live critic.
+        # v2: critic predicts symlog-space; MSE against symlog(returns) keeps
+        # targets bounded when returns accumulate (Breakout: +1/+4/+7 per brick
+        # drove v1's critic loss from 0.05 → 241 over last 100k steps).
         critic_values = self.critic(h_imag.detach(), z_imag.detach())
-        critic_loss = F.mse_loss(critic_values, lambda_returns.detach())
+        critic_target = symlog(lambda_returns.detach()) if self.use_symlog else lambda_returns.detach()
+        critic_loss = F.mse_loss(critic_values, critic_target)
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
-        critic_grad = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        critic_grad = nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
         self.critic_opt.step()
 
         # ── EMA update target critic ──

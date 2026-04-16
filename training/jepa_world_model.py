@@ -97,6 +97,8 @@ class JEPAWorldModel(nn.Module):
             x = self.encoder_bn(x.reshape(B * T, D)).reshape(B, T, D)
         else:
             x = self.encoder_bn(x)
+        # Clamp to prevent runaway magnitudes that lead to NaN downstream
+        x = x.clamp(-10, 10)
         return x
 
     def forward(self, obs, actions, rewards, dones=None):
@@ -210,6 +212,11 @@ class JEPAWorldModelTrainer:
 
         with autocast(device_type="cuda", enabled=self.use_amp):
             losses, info = self.model(obs, actions, rewards, dones=dones)
+
+        if torch.isnan(losses["total"]) or torch.isinf(losses["total"]):
+            print(f"WARNING: NaN/Inf in total loss, skipping step. "
+                  f"Losses: {{{', '.join(f'{k}={v.item():.4f}' for k, v in losses.items())}}}")
+            return {k: v.item() for k, v in losses.items()}, info
 
         self.scaler.scale(losses["total"]).backward()
         self.scaler.unscale_(self.optimizer)

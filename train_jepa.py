@@ -84,7 +84,9 @@ class JEPACollector:
                 self.world_model.encoder.train()
                 self.world_model.encoder_bn.train()
 
-                if random:
+                if random or torch.isnan(embeds).any():
+                    if not random and torch.isnan(embeds).any():
+                        print("WARNING: NaN in embeddings, falling back to random actions")
                     action_indices = np.array([env.action_space.sample()
                                                for env in self.envs])
                     actions_onehot = np.zeros((self.n_envs, self.act_dim), dtype=np.float32)
@@ -93,7 +95,13 @@ class JEPACollector:
                 else:
                     dist = self.actor(embeds)
                     action_indices_t = dist.sample()
-                    action_indices = action_indices_t.cpu().numpy()
+                    # Guard against NaN from actor
+                    if torch.isnan(action_indices_t).any():
+                        print("WARNING: NaN in actor output, falling back to random actions")
+                        action_indices = np.array([env.action_space.sample()
+                                                   for env in self.envs])
+                    else:
+                        action_indices = action_indices_t.cpu().numpy()
                     actions_onehot = np.zeros((self.n_envs, self.act_dim), dtype=np.float32)
                     for i, idx in enumerate(action_indices):
                         actions_onehot[i, idx] = 1.0

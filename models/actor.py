@@ -32,12 +32,12 @@ class Actor(nn.Module):
             self.mean_head = nn.Linear(units, act_dim)
             self.log_std_head = nn.Linear(units, act_dim)
 
-    def forward(self, h: torch.Tensor, z: torch.Tensor):
+    def forward(self, h: torch.Tensor, z: torch.Tensor = None):
         """
         Returns:
             dist: action distribution
         """
-        x = self.trunk(torch.cat([h, z], dim=-1))
+        x = self.trunk(torch.cat([h, z], dim=-1) if z is not None else h)
 
         if self.discrete:
             logits = self.head(x)
@@ -55,7 +55,7 @@ class Actor(nn.Module):
             base_dist = Normal(mean, std)
             return TransformedDistribution(base_dist, [TanhTransform(cache_size=1)])
 
-    def get_action(self, h: torch.Tensor, z: torch.Tensor):
+    def get_action(self, h: torch.Tensor, z: torch.Tensor = None):
         """Sample action and return (action, log_prob, entropy).
 
         For discrete: uses straight-through gradients so that the forward

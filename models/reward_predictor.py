@@ -17,15 +17,15 @@ class RewardPredictor(nn.Module):
             nn.Linear(units, 1),
         )
 
-    def forward(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, z: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             h: (..., hidden_dim)
-            z: (..., stoch_dim)
+            z: (..., stoch_dim) or None for JEPA mode
         Returns:
             (...,) predicted reward
         """
-        return self.net(torch.cat([h, z], dim=-1)).squeeze(-1)
+        return self.net(torch.cat([h, z], dim=-1) if z is not None else h).squeeze(-1)
 
 
 if __name__ == "__main__":

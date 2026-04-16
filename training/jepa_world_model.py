@@ -192,13 +192,26 @@ class JEPAWorldModelTrainer:
         self.model = world_model.to(device)
         self.device = device
         self.lr = cfg.get("learning_rate", 1e-4)
-        self.max_grad_norm = cfg.get("max_grad_norm", 10.0)
+        self.max_grad_norm = cfg.get("max_grad_norm", 2.0)
         self.use_amp = cfg.get("mixed_precision", False) and device.type == "cuda"
 
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=self.lr, eps=1e-5
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=self.lr, eps=1e-5, weight_decay=5e-4
         )
         self.scaler = GradScaler("cuda", enabled=self.use_amp)
+
+        # LR schedule: linear warmup + cosine decay
+        warmup_steps = cfg.get("warmup_steps", 5000)
+        total_steps = cfg.get("total_steps", 500000)
+        self.warmup_steps = warmup_steps
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + __import__('math').cos(__import__('math').pi * progress))
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def train_step(self, batch: dict) -> tuple[dict, dict]:
         obs = batch["obs"].to(self.device)
@@ -220,14 +233,18 @@ class JEPAWorldModelTrainer:
 
         self.scaler.scale(losses["total"]).backward()
         self.scaler.unscale_(self.optimizer)
-        nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        self.scheduler.step()
 
         info = {k: v.float() if torch.is_tensor(v) and v.is_floating_point() else v
                 for k, v in info.items()}
 
-        return {k: v.item() for k, v in losses.items()}, info
+        loss_dict = {k: v.item() for k, v in losses.items()}
+        loss_dict["grad_norm"] = grad_norm.item()
+        loss_dict["lr"] = self.optimizer.param_groups[0]["lr"]
+        return loss_dict, info
 
 
 if __name__ == "__main__":

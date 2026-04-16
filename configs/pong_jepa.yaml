@@ -40,8 +40,10 @@ batch_length: 30
 learning_rate: 1.0e-4
 actor_lr: 1.0e-4
 critic_lr: 1.0e-4
-max_grad_norm: 10.0
+max_grad_norm: 2.0
 mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
 
 # Parallel collection
 n_envs: 24

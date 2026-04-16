@@ -245,6 +245,8 @@ def main():
                 critic.load_state_dict(ckpt["critic"])
                 ac_trainer.target_critic.load_state_dict(ckpt["target_critic"])
                 wm_trainer.optimizer.load_state_dict(ckpt["wm_optimizer"])
+                if "wm_scheduler" in ckpt:
+                    wm_trainer.scheduler.load_state_dict(ckpt["wm_scheduler"])
                 ac_trainer.actor_opt.load_state_dict(ckpt["actor_optimizer"])
                 ac_trainer.critic_opt.load_state_dict(ckpt["critic_optimizer"])
                 global_step = ckpt["global_step"]
@@ -315,6 +317,7 @@ def main():
             "critic": critic.state_dict(),
             "target_critic": ac_trainer.target_critic.state_dict(),
             "wm_optimizer": wm_trainer.optimizer.state_dict(),
+            "wm_scheduler": wm_trainer.scheduler.state_dict(),
             "actor_optimizer": ac_trainer.actor_opt.state_dict(),
             "critic_optimizer": ac_trainer.critic_opt.state_dict(),
         }, path)

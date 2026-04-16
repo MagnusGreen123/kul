@@ -77,9 +77,9 @@ class JEPAActorCriticTrainer:
 
         actor_lr = cfg.get("actor_lr", cfg.get("learning_rate", 1e-4))
         critic_lr = cfg.get("critic_lr", cfg.get("learning_rate", 1e-4))
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr, eps=1e-5)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=critic_lr, eps=1e-5)
-        self.max_grad_norm = cfg.get("max_grad_norm", 10.0)
+        self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=actor_lr, eps=1e-5, weight_decay=5e-4)
+        self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=critic_lr, eps=1e-5, weight_decay=5e-4)
+        self.max_grad_norm = cfg.get("max_grad_norm", 2.0)
         self.critic_grad_clip = cfg.get("critic_grad_clip", self.max_grad_norm)
 
         # Return normalization — EMA of 5th/95th percentiles

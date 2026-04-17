@@ -41,12 +41,18 @@ class Actor(nn.Module):
 
         if self.discrete:
             logits = self.head(x)
-            # Unimix: blend with uniform distribution to prevent entropy collapse
-            # without needing a large entropy bonus (DreamerV3 technique)
+            # Clamp logits to prevent overflow in softmax/log_softmax
+            logits = logits.clamp(-20, 20)
+            # Unimix: blend with uniform in log-space for numerical stability
             if self.unimix > 0:
-                probs = F.softmax(logits, dim=-1)
-                probs = (1 - self.unimix) * probs + self.unimix / self.act_dim
-                return Categorical(probs=probs)
+                log_probs = F.log_softmax(logits, dim=-1)
+                log_uniform = torch.full_like(log_probs, -torch.log(torch.tensor(float(self.act_dim))))
+                # log((1-u)*softmax + u/K) via log-sum-exp
+                mixed = torch.logaddexp(
+                    log_probs + torch.log(torch.tensor(1.0 - self.unimix)),
+                    log_uniform + torch.log(torch.tensor(self.unimix)),
+                )
+                return Categorical(logits=mixed)
             return Categorical(logits=logits)
         else:
             mean = self.mean_head(x)

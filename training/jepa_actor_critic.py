@@ -127,8 +127,12 @@ class JEPAActorCriticTrainer:
         reward_list, value_list = [], []
         log_prob_list, entropy_list, cont_list = [], [], []
 
-        for _ in range(self.horizon):
+        for step_i in range(self.horizon):
             current_emb = emb_buffer[-1]
+
+            # Bail early if embeddings went NaN (prevents corrupting actor)
+            if torch.isnan(current_emb).any():
+                break
 
             # Actor selects action (has grad for REINFORCE)
             action, log_prob, entropy = self.actor.get_action(current_emb)
@@ -140,14 +144,14 @@ class JEPAActorCriticTrainer:
                 ctx_embs = torch.stack(emb_buffer[-HS:], dim=1)  # (B, L, D)
                 ctx_acts = torch.stack(act_buffer[-HS:], dim=1)   # (B, L, act_dim)
 
-                # Predict next embedding
+                # Predict next embedding — clamp to prevent drift over H steps
                 pred = self.world_model.predictor(ctx_embs, ctx_acts)
-                next_emb = pred[:, -1]  # (B, D)
+                next_emb = pred[:, -1].clamp(-10, 10)  # (B, D)
                 emb_buffer.append(next_emb)
 
                 # Predict reward, value, continuation from next state
-                reward = self.world_model.reward_pred(next_emb)
-                value_out = self.target_critic(next_emb)
+                reward = self.world_model.reward_pred(next_emb).clamp(-5, 5)
+                value_out = self.target_critic(next_emb).clamp(-10, 10)
                 value = symexp(value_out) if self.use_symlog else value_out
                 cont = torch.sigmoid(self.world_model.cont_pred(next_emb))
 
@@ -157,6 +161,16 @@ class JEPAActorCriticTrainer:
             log_prob_list.append(log_prob)
             entropy_list.append(entropy)
             cont_list.append(cont)
+
+        if not emb_list:
+            # Early break on first step — return zero-length tensors
+            B = initial_emb.shape[0]
+            D = initial_emb.shape[1]
+            empty = lambda *s: torch.zeros(*s, device=self.device)
+            return (
+                empty(B, 0, D), empty(B, 0), empty(B, 0),
+                empty(B, 0), empty(B, 0), empty(B, 0),
+            )
 
         return (
             torch.stack(emb_list, dim=1),       # (B, H, D)
@@ -196,11 +210,20 @@ class JEPAActorCriticTrainer:
         start_emb = emb_seq[torch.arange(B), t_indices].detach()
 
         # Imagination rollout
-        emb_imag, rewards, values, log_probs, entropies, conts = \
-            self.imagine_rollout(start_emb)
+        rollout = self.imagine_rollout(start_emb)
+        emb_imag, rewards, values, log_probs, entropies, conts = rollout
+
+        # Skip AC update if imagination produced empty or NaN results
+        if emb_imag.shape[1] == 0 or torch.isnan(rewards).any():
+            return {
+                "actor_loss": 0.0, "critic_loss": 0.0,
+                "imagined_reward": 0.0, "imagined_value": 0.0,
+                "entropy": 0.0, "cont_mean": 0.0,
+                "actor_grad_norm": 0.0, "critic_grad_norm": 0.0,
+            }
 
         if self.use_symlog:
-            rewards = symexp(rewards)
+            rewards = symexp(rewards).clamp(-10, 10)
 
         # Lambda-returns
         lambda_returns = compute_lambda_returns(
@@ -211,6 +234,15 @@ class JEPAActorCriticTrainer:
         normed_returns = self._normalize_returns(lambda_returns)
         actor_loss = -(normed_returns.detach() * log_probs).mean() \
                      - self.entropy_coeff * entropies.mean()
+
+        if torch.isnan(actor_loss) or torch.isinf(actor_loss):
+            return {
+                "actor_loss": 0.0, "critic_loss": 0.0,
+                "imagined_reward": rewards.mean().item(),
+                "imagined_value": values.mean().item(),
+                "entropy": entropies.mean().item(), "cont_mean": conts.mean().item(),
+                "actor_grad_norm": 0.0, "critic_grad_norm": 0.0,
+            }
 
         self.actor_opt.zero_grad()
         actor_loss.backward()

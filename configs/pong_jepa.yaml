@@ -25,7 +25,8 @@ rollout_weight: 0.5       # 2-step rollout loss
 reward_weight: 10.0       # same as RSSM version
 use_symlog: true
 
-# Actor-critic (unchanged from Dreamer v24)
+# Actor-critic
+ac_warmup_steps: 20000   # train only world model for first 20k steps
 act_dim: 6
 mlp_units: 400
 horizon: 15

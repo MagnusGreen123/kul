@@ -276,6 +276,10 @@ def main():
     logger = Logger(cfg, use_wandb=cfg.get("use_wandb", False))
 
     collect_per_step = cfg.get("collect_per_step", 1000)
+    ac_warmup_steps = cfg.get("ac_warmup_steps", 0)
+    if ac_warmup_steps > 0:
+        print(f"AC warmup: training only world model for first {ac_warmup_steps} steps")
+    _ac_warmup_logged = False
 
     # ── Prefill ──
     if args.resume and global_step > 0:
@@ -350,9 +354,15 @@ def main():
 
                 wm_losses, wm_info = wm_trainer.train_step(batch)
 
-                ac_losses = ac_trainer.train_step(
-                    wm_info["emb_seq"], dones=wm_info.get("dones")
-                )
+                if global_step >= ac_warmup_steps:
+                    if not _ac_warmup_logged and ac_warmup_steps > 0:
+                        print(f"AC warmup complete at step {global_step} — starting actor-critic training")
+                        _ac_warmup_logged = True
+                    ac_losses = ac_trainer.train_step(
+                        wm_info["emb_seq"], dones=wm_info.get("dones")
+                    )
+                else:
+                    ac_losses = {}
 
                 all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
                               **{f"ac/{k}": v for k, v in ac_losses.items()}}

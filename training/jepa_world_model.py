@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, ".")
 
 from models.encoder import ConvEncoder
+from models.decoder import ConvDecoder
 from models.jepa_predictor import ActionConditionedPredictor
 from models.sigreg import SIGReg
 from models.reward_predictor import RewardPredictor
@@ -71,6 +72,19 @@ class JEPAWorldModel(nn.Module):
         self.cont_pred = ContPredictor(
             hidden_dim=embed_dim, stoch_dim=0, units=mlp_units
         )
+
+        # Auxiliary decoder — forces encoder to preserve pixel-level detail
+        # (especially foreground objects like ball/paddle via fg_weight)
+        self.aux_recon_weight = cfg.get("aux_recon_weight", 0.0)
+        if self.aux_recon_weight > 0:
+            self.aux_decoder = ConvDecoder(
+                latent_dim=embed_dim, out_channels=obs_channels,
+                depth=cfg.get("aux_decoder_depth", 32),
+            )
+            self.fg_weight = cfg.get("fg_weight", 50.0)
+        else:
+            self.aux_decoder = None
+            self.fg_weight = 0.0
 
         # Loss weights
         self.pred_weight = cfg.get("pred_weight", 1.0)
@@ -161,6 +175,20 @@ class JEPAWorldModel(nn.Module):
         else:
             cont_loss = torch.zeros(1, device=obs.device)
 
+        # ── Auxiliary reconstruction (fg-weighted) ──
+        if self.aux_decoder is not None:
+            recon = self.aux_decoder(embeddings)  # (B, T, C, H, W)
+            diff = torch.zeros_like(obs)
+            diff[:, 1:] = (obs[:, 1:] - obs[:, :-1]).abs()
+            fg_mask = diff.mean(dim=2, keepdim=True)  # (B,T,1,H,W)
+            weight = 1.0 + self.fg_weight * fg_mask
+            sq_err = (obs - recon) ** 2
+            # mean reduction keeps scale comparable to pred_loss (~0.3)
+            # fg_weight still gives 26:1 foreground:background gradient ratio
+            aux_recon_loss = (sq_err * weight).mean()
+        else:
+            aux_recon_loss = torch.zeros(1, device=obs.device)
+
         # ── Total loss ──
         total_loss = (
             self.pred_weight * pred_loss
@@ -168,6 +196,7 @@ class JEPAWorldModel(nn.Module):
             + self.sigreg_weight * sigreg_loss
             + self.reward_weight * reward_loss
             + cont_loss
+            + self.aux_recon_weight * aux_recon_loss
         )
 
         losses = {
@@ -177,6 +206,7 @@ class JEPAWorldModel(nn.Module):
             "sigreg": sigreg_loss,
             "reward": reward_loss,
             "cont": cont_loss,
+            "aux_recon": aux_recon_loss,
         }
         info = {
             "emb_seq": embeddings.detach(),

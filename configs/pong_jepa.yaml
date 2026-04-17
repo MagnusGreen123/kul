@@ -25,6 +25,11 @@ rollout_weight: 0.5       # 2-step rollout loss
 reward_weight: 10.0       # same as RSSM version
 use_symlog: true
 
+# Auxiliary decoder — forces encoder to capture foreground (ball/paddle)
+aux_recon_weight: 1.0     # weight for auxiliary reconstruction loss
+aux_decoder_depth: 32     # lighter decoder than main (32 vs 48)
+fg_weight: 50.0           # same fg_weight that worked for RSSM v24
+
 # Actor-critic
 ac_warmup_steps: 20000   # train only world model for first 20k steps
 act_dim: 6
@@ -64,4 +69,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "jepa-v1"
+run_name: "jepa-v2"

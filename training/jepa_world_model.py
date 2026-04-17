@@ -133,7 +133,15 @@ class JEPAWorldModel(nn.Module):
         embeddings = self.encode(obs)  # (B, T, D)
 
         # ── SIGReg: enforce N(0, I) on embeddings ──
-        sigreg_loss = self.sigreg(embeddings.reshape(B * T, self.embed_dim))
+        # Subsample to fixed size so the Epps-Pulley * N term doesn't scale
+        # with batch_size * batch_length (which was 15360 and made SIGReg
+        # dominate 87% of total loss, starving pred/reward gradients).
+        flat_emb = embeddings.reshape(B * T, self.embed_dim)
+        max_sigreg_samples = 1024
+        if flat_emb.shape[0] > max_sigreg_samples:
+            idx = torch.randperm(flat_emb.shape[0], device=flat_emb.device)[:max_sigreg_samples]
+            flat_emb = flat_emb[idx]
+        sigreg_loss = self.sigreg(flat_emb)
 
         # ── Teacher-forcing prediction ──
         # (e_t, a_t) -> predict e_{t+1}

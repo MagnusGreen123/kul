@@ -175,16 +175,26 @@ class JEPAWorldModel(nn.Module):
         else:
             cont_loss = torch.zeros(1, device=obs.device)
 
-        # ── Auxiliary reconstruction (fg-weighted) ──
+        # ── Auxiliary reconstruction (fg-weighted, subsampled for memory) ──
         if self.aux_decoder is not None:
-            recon = self.aux_decoder(embeddings)  # (B, T, C, H, W)
-            diff = torch.zeros_like(obs)
-            diff[:, 1:] = (obs[:, 1:] - obs[:, :-1]).abs()
-            fg_mask = diff.mean(dim=2, keepdim=True)  # (B,T,1,H,W)
+            # Subsample to avoid OOM: decode max 64 random frames from B*T
+            BT = B * T
+            max_aux_frames = min(BT, 64)
+            idx = torch.randperm(BT, device=obs.device)[:max_aux_frames]
+            emb_sub = embeddings.reshape(BT, -1)[idx]       # (S, D)
+            obs_sub = obs.reshape(BT, *obs.shape[2:])[idx]  # (S, C, H, W)
+
+            recon = self.aux_decoder(emb_sub)  # (S, C, H, W)
+
+            # fg_weight: need consecutive frame pairs for temporal diff
+            # Use obs_flat for diff computation on subsampled indices
+            obs_flat = obs.reshape(BT, *obs.shape[2:])
+            # For each sampled idx, compute |obs[idx] - obs[idx-1]| (wrap to 0 for idx=0)
+            prev_idx = (idx - 1).clamp(min=0)
+            diff = (obs_flat[idx] - obs_flat[prev_idx]).abs()
+            fg_mask = diff.mean(dim=1, keepdim=True)  # (S, 1, H, W)
             weight = 1.0 + self.fg_weight * fg_mask
-            sq_err = (obs - recon) ** 2
-            # mean reduction keeps scale comparable to pred_loss (~0.3)
-            # fg_weight still gives 26:1 foreground:background gradient ratio
+            sq_err = (obs_sub - recon) ** 2
             aux_recon_loss = (sq_err * weight).mean()
         else:
             aux_recon_loss = torch.zeros(1, device=obs.device)

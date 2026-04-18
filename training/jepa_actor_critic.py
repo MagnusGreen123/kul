@@ -19,12 +19,7 @@ sys.path.insert(0, ".")
 
 from models.actor import Actor
 from models.critic import Critic
-from training.jepa_world_model import JEPAWorldModel, symlog
-
-
-def symexp(x: torch.Tensor) -> torch.Tensor:
-    """Inverse of symlog."""
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+from training.jepa_world_model import JEPAWorldModel
 
 
 def compute_lambda_returns(rewards, values, gamma: float = 0.997,
@@ -71,7 +66,6 @@ class JEPAActorCriticTrainer:
         self.horizon = cfg.get("horizon", 15)
         self.gamma = cfg.get("gamma", 0.997)
         self.lambda_ = cfg.get("lambda_", 0.95)
-        self.use_symlog = cfg.get("use_symlog", True)
         self.entropy_coeff = cfg.get("entropy_coeff", 3e-3)
         self.history_size = cfg.get("history_size", 3)
 
@@ -150,9 +144,11 @@ class JEPAActorCriticTrainer:
                 emb_buffer.append(next_emb)
 
                 # Predict reward, value, continuation from next state
+                # Keep reward and value in symlog space so lambda-returns
+                # stay bounded — symexp here caused a self-reinforcing
+                # value explosion (9740 when true value is ~-8).
                 reward = self.world_model.reward_pred(next_emb).clamp(-5, 5)
-                value_out = self.target_critic(next_emb).clamp(-10, 10)
-                value = symexp(value_out) if self.use_symlog else value_out
+                value = self.target_critic(next_emb).clamp(-10, 10)
                 cont = torch.sigmoid(self.world_model.cont_pred(next_emb))
 
             emb_list.append(next_emb)
@@ -222,10 +218,8 @@ class JEPAActorCriticTrainer:
                 "actor_grad_norm": 0.0, "critic_grad_norm": 0.0,
             }
 
-        if self.use_symlog:
-            rewards = symexp(rewards).clamp(-10, 10)
-
-        # Lambda-returns
+        # Lambda-returns (computed in symlog space — rewards and values
+        # are already in symlog space from imagine_rollout)
         lambda_returns = compute_lambda_returns(
             rewards, values, self.gamma, self.lambda_, continuations=conts
         )
@@ -249,9 +243,9 @@ class JEPAActorCriticTrainer:
         actor_grad = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_opt.step()
 
-        # ── Critic loss ── MSE on symlog lambda-returns
+        # ── Critic loss ── MSE on lambda-returns (already in symlog space)
         critic_values = self.critic(emb_imag.detach())
-        critic_target = symlog(lambda_returns.detach()) if self.use_symlog else lambda_returns.detach()
+        critic_target = lambda_returns.detach()
         critic_loss = F.mse_loss(critic_values, critic_target)
 
         self.critic_opt.zero_grad()

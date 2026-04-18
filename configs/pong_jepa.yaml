@@ -69,4 +69,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "jepa-v3"
+run_name: "jepa-v4"

@@ -39,6 +39,7 @@ gamma: 0.997
 lambda_: 0.95
 entropy_coeff: 3.0e-3
 critic_ema_decay: 0.98
+critic_grad_clip: 10       # v5 fix: critic pre-clip norm was 54, let it take bigger steps
 
 # Training
 batch_size: 512

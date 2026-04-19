@@ -1,0 +1,72 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3          # context window for imagination rollouts (like LeWM)
+
+# SIGReg — isotropic Gaussian regularizer (replaces KL + stop-gradient)
+sigreg_weight: 0.01      # v4=0.1 — 10x lower to allow more embedding structure
+sigreg_knots: 17         # quadrature points for Epps-Pulley integral
+sigreg_projections: 1024 # random projection directions
+
+# Loss weights
+pred_weight: 5.0          # v4=1.0 — 5x higher to force predictable embeddings
+rollout_weight: 0.5       # 2-step rollout loss
+reward_weight: 10.0       # same as RSSM version
+use_symlog: true
+
+# Auxiliary decoder — forces encoder to capture foreground (ball/paddle)
+aux_recon_weight: 1.0     # weight for auxiliary reconstruction loss
+aux_decoder_depth: 32     # lighter decoder than main (32 vs 48)
+fg_weight: 50.0           # same fg_weight that worked for RSSM v24
+
+# Actor-critic
+ac_warmup_steps: 20000   # train only world model for first 20k steps
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+critic_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+eval_every: 20000
+
+# Buffer
+buffer_max_steps: 2000000
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v5"

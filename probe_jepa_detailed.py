@@ -86,17 +86,28 @@ def find_ball_pixel(frame, debug=False):
     pf_std = playfield.std()
     thresh = pf_mean + 2.0 * pf_std
     bright = playfield > thresh
+
+    # Step 1b: remove horizontal bright lines (score borders, dividers)
+    # A row where >30% of pixels are bright is a border line, not an object
+    PH, PW = playfield.shape
+    row_bright_frac = bright.float().mean(dim=1)  # fraction bright per row
+    border_rows = row_bright_frac > 0.3
+    if border_rows.any():
+        bright[border_rows] = False
+
     bright_coords = bright.nonzero(as_tuple=False)  # (K, 2) — row, col in playfield coords
 
     if debug:
+        n_border = border_rows.sum().item()
         print(f"      playfield mean={pf_mean:.3f} std={pf_std:.3f} thresh={thresh:.3f}")
-        print(f"      bright pixels: {len(bright_coords)}")
+        print(f"      border rows removed: {n_border}")
+        print(f"      bright pixels (after border removal): {len(bright_coords)}")
 
     if len(bright_coords) < 1:
         return None
 
     # Step 2: count bright pixels per column — paddle columns have many, ball has few
-    col_counts = torch.zeros(W, dtype=torch.long)
+    col_counts = torch.zeros(PW, dtype=torch.long)
     for _, c in bright_coords:
         col_counts[c] += 1
 

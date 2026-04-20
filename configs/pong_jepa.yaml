@@ -39,6 +39,7 @@ gamma: 0.997
 lambda_: 0.95
 entropy_coeff: 3.0e-3
 critic_ema_decay: 0.98
+critic_grad_clip: 10.0    # prevent critic gradient explosion (v4 needed this late-stage)
 
 # Training
 batch_size: 512
@@ -69,4 +70,4 @@ buffer_max_steps: 2000000
 # Wandb
 wandb_project: "dreamer"
 use_wandb: true
-run_name: "jepa-v4"
+run_name: "jepa-v6"

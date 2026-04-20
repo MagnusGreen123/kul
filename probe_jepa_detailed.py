@@ -72,52 +72,53 @@ def find_ball_pixel(frame):
     Returns:
         (row, col) tuple in pixels, or None if no ball found.
 
-    Method: adaptive threshold — find pixels significantly brighter than the
-    local playfield background. The ball is the only small bright object in
-    the mid-field region (between paddles, below score).
+    Method: find all bright pixels below the score area, then separate the
+    ball from paddles by shape — paddles are tall vertical bars (many bright
+    pixels in the same column), the ball is small (1-2 pixels per column).
+    No hardcoded column positions needed.
     """
     H, W = frame.shape
 
-    # Build valid-region mask (playfield minus paddles, score, center line)
-    region_mask = torch.zeros(H, W, dtype=torch.bool)
-    region_mask[SCORE_ROWS:, :] = True
-    region_mask[:, :PADDLE_L_MAX] = False
-    region_mask[:, PADDLE_R_MIN:] = False
-    region_mask[:, CENTER_COL - 1:CENTER_COL + 2] = False
+    # Step 1: find all bright pixels in playfield (below score)
+    playfield = frame[SCORE_ROWS:, :]  # (H-12, W)
+    thresh = playfield.mean() + 2.0 * playfield.std()
+    bright = playfield > thresh
+    bright_coords = bright.nonzero(as_tuple=False)  # (K, 2) — row, col in playfield coords
 
-    region_vals = frame[region_mask]
-    if len(region_vals) == 0:
+    if len(bright_coords) < 1:
         return None
 
-    # Adaptive threshold: background mean + N*std
-    # The ball is much brighter than background, so this catches it
-    bg_mean = region_vals.mean()
-    bg_std = region_vals.std()
+    # Step 2: count bright pixels per column — paddle columns have many, ball has few
+    col_counts = torch.zeros(W, dtype=torch.long)
+    for _, c in bright_coords:
+        col_counts[c] += 1
 
-    # Try progressively lower thresholds until we find a small cluster
-    for n_sigma in [5, 4, 3, 2.5]:
-        thresh = bg_mean + n_sigma * bg_std
-        bright = frame > thresh
-        candidates = (bright & region_mask).nonzero(as_tuple=False)
+    # Paddle columns: >= 4 bright pixels vertically (paddles are ~8-15px tall at 64x64)
+    paddle_cols = col_counts >= 4
 
-        if len(candidates) == 0:
-            continue
-        if len(candidates) > 20:
-            continue  # too many — threshold too low, try higher
+    # Step 3: filter out paddle pixels — keep only pixels in non-paddle columns
+    ball_candidates = []
+    for r, c in bright_coords:
+        if not paddle_cols[c]:
+            ball_candidates.append((r.item(), c.item()))
 
-        # Ball is small: 1-8 pixels at 64x64
-        # Check that candidates form a compact cluster (not scattered noise)
-        if len(candidates) > 1:
-            center = candidates.float().mean(dim=0)
-            dists = (candidates.float() - center).pow(2).sum(dim=1).sqrt()
-            if dists.max() > 5:
-                continue  # scattered pixels, not a ball
+    if len(ball_candidates) == 0:
+        return None
 
-        center_row = candidates[:, 0].float().mean().item()
-        center_col = candidates[:, 1].float().mean().item()
-        return (center_row, center_col)
+    # Step 4: ball should be a small cluster (1-6 pixels)
+    if len(ball_candidates) > 12:
+        return None  # too many non-paddle bright pixels, ambiguous
 
-    return None
+    # Check compactness
+    coords = torch.tensor(ball_candidates, dtype=torch.float32)
+    center = coords.mean(dim=0)
+    if len(ball_candidates) > 1:
+        dists = (coords - center).pow(2).sum(dim=1).sqrt()
+        if dists.max() > 4:
+            return None  # scattered, not a single ball
+
+    # Return in full-frame coordinates (add SCORE_ROWS offset to row)
+    return (center[0].item() + SCORE_ROWS, center[1].item())
 
 
 def detect_all_balls(obs, debug=False):

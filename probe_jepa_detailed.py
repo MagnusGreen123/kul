@@ -72,45 +72,60 @@ def find_ball_pixel(frame):
     Returns:
         (row, col) tuple in pixels, or None if no ball found.
 
-    Method: find bright pixels in the playfield that are NOT paddles or center line.
-    The ball is the only small bright object in the mid-playfield region.
+    Method: adaptive threshold — find pixels significantly brighter than the
+    local playfield background. The ball is the only small bright object in
+    the mid-field region (between paddles, below score).
     """
     H, W = frame.shape
 
-    # Bright pixel threshold — background is ~-0.3, objects are > -0.1
-    bright = frame > -0.1
+    # Build valid-region mask (playfield minus paddles, score, center line)
+    region_mask = torch.zeros(H, W, dtype=torch.bool)
+    region_mask[SCORE_ROWS:, :] = True
+    region_mask[:, :PADDLE_L_MAX] = False
+    region_mask[:, PADDLE_R_MIN:] = False
+    region_mask[:, CENTER_COL - 1:CENTER_COL + 2] = False
 
-    # Mask out non-ball regions
-    mask = torch.zeros_like(bright)
-    # Playfield only (no score area)
-    mask[SCORE_ROWS:, :] = True
-    # Exclude paddle columns
-    mask[:, :PADDLE_L_MAX] = False
-    mask[:, PADDLE_R_MIN:] = False
-    # Exclude center line region (col 31-33)
-    mask[:, CENTER_COL - 1:CENTER_COL + 2] = False
-
-    candidates = (bright & mask).nonzero(as_tuple=False)  # (K, 2)
-
-    if len(candidates) == 0:
+    region_vals = frame[region_mask]
+    if len(region_vals) == 0:
         return None
 
-    # Ball should be a small cluster (1-6 pixels after resize)
-    # If too many bright pixels in playfield, something is wrong
-    if len(candidates) > 15:
-        return None
+    # Adaptive threshold: background mean + N*std
+    # The ball is much brighter than background, so this catches it
+    bg_mean = region_vals.mean()
+    bg_std = region_vals.std()
 
-    # Centroid of the candidate pixels
-    center_row = candidates[:, 0].float().mean().item()
-    center_col = candidates[:, 1].float().mean().item()
-    return (center_row, center_col)
+    # Try progressively lower thresholds until we find a small cluster
+    for n_sigma in [5, 4, 3, 2.5]:
+        thresh = bg_mean + n_sigma * bg_std
+        bright = frame > thresh
+        candidates = (bright & region_mask).nonzero(as_tuple=False)
+
+        if len(candidates) == 0:
+            continue
+        if len(candidates) > 20:
+            continue  # too many — threshold too low, try higher
+
+        # Ball is small: 1-8 pixels at 64x64
+        # Check that candidates form a compact cluster (not scattered noise)
+        if len(candidates) > 1:
+            center = candidates.float().mean(dim=0)
+            dists = (candidates.float() - center).pow(2).sum(dim=1).sqrt()
+            if dists.max() > 5:
+                continue  # scattered pixels, not a ball
+
+        center_row = candidates[:, 0].float().mean().item()
+        center_col = candidates[:, 1].float().mean().item()
+        return (center_row, center_col)
+
+    return None
 
 
-def detect_all_balls(obs):
+def detect_all_balls(obs, debug=False):
     """Detect ball in all frames. Uses the newest frame (last channel).
 
     Args:
         obs: (N, C, H, W) tensor
+        debug: if True, print stats for first few frames
 
     Returns:
         positions: (N, 2) tensor with (row, col) in pixels, NaN if not found
@@ -125,6 +140,16 @@ def detect_all_balls(obs):
         if result is not None:
             positions[i, 0] = result[0]
             positions[i, 1] = result[1]
+
+        if debug and i < 5:
+            H, W = frame.shape
+            region_mask = torch.zeros(H, W, dtype=torch.bool)
+            region_mask[SCORE_ROWS:, :] = True
+            region_mask[:, :PADDLE_L_MAX] = False
+            region_mask[:, PADDLE_R_MIN:] = False
+            rv = frame[region_mask]
+            print(f"    frame {i}: region min={rv.min():.3f} mean={rv.mean():.3f} "
+                  f"max={rv.max():.3f} std={rv.std():.3f} | ball={'found' if result else 'none'}")
 
     valid = ~torch.isnan(positions[:, 0])
     return positions, valid
@@ -185,62 +210,74 @@ def main():
     print(f"  emb: {all_emb.shape}, mean={all_emb.mean():.4f}, std={all_emb.std():.4f}")
 
     # ── Detect ball in all frames ──
-    print("\nDetecting ball positions (pixel-based)...")
-    ball_pos, ball_valid = detect_all_balls(obs_all.cpu())
+    print("\nDetecting ball positions (pixel-based, adaptive threshold)...")
+    ball_pos, ball_valid = detect_all_balls(obs_all.cpu(), debug=True)
     n_valid = ball_valid.sum().item()
     print(f"  Found ball in {n_valid}/{N} frames ({100 * n_valid / N:.1f}%)")
 
-    # ── Save ball detection verification ──
-    # Show 20 frames where ball was detected, with red circle markers
-    print("  Saving ball detection verification...")
-    valid_indices = ball_valid.nonzero(as_tuple=True)[0]
-    # Sample evenly from valid frames
-    if len(valid_indices) > 20:
-        sample_idx = valid_indices[torch.linspace(0, len(valid_indices) - 1, 20).long()]
-    else:
-        sample_idx = valid_indices[:20]
+    # Save raw frame samples so we can debug visually regardless of detection
+    print("  Saving raw frame samples...")
+    sample_every = max(1, N // 20)
+    raw_idx = list(range(0, N, sample_every))[:20]
+    n_raw = len(raw_idx)
+    fig, axes = plt.subplots(2, n_raw, figsize=(2.5 * n_raw, 5))
+    for i in range(n_raw):
+        idx = raw_idx[i]
+        # Newest frame (channel -1), full contrast stretch
+        newest = obs_all[idx, -1].cpu().numpy()
+        # Also show oldest frame for temporal diff
+        oldest = obs_all[idx, 0].cpu().numpy()
 
-    n_show = min(20, len(sample_idx))
-    cols = 10
-    rows = (n_show + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(2.5 * cols, 2.5 * rows))
-    axes = np.array(axes).reshape(-1)
-    for ax in axes:
-        ax.axis("off")
-    for i in range(n_show):
-        idx = sample_idx[i].item()
-        img = frame_to_img(obs_all[idx, -1].cpu())
-        axes[i].imshow(img, cmap="gray", vmin=0, vmax=255)
-        # Mark detected ball with red circle
-        r, c = ball_pos[idx, 0].item(), ball_pos[idx, 1].item()
-        circle = Circle((c, r), radius=3, fill=False, edgecolor="red", linewidth=2)
-        axes[i].add_patch(circle)
-        axes[i].set_title(f"#{idx}", fontsize=8)
-    fig.suptitle(f"Ball detection verification ({n_valid}/{N} found)", fontsize=13)
+        for row, (data, label) in enumerate([(newest, "ch3 (new)"), (oldest, "ch0 (old)")]):
+            img = np.clip((data + 0.5) * 255, 0, 255).astype(np.uint8)
+            axes[row, i].imshow(img, cmap="gray", vmin=0, vmax=255)
+            axes[row, i].axis("off")
+            if i == 0:
+                axes[row, i].set_ylabel(label, fontsize=10)
+            # Mark ball if found
+            if ball_valid[idx] and row == 0:
+                r, c = ball_pos[idx, 0].item(), ball_pos[idx, 1].item()
+                circle = Circle((c, r), radius=3, fill=False, edgecolor="red", linewidth=2)
+                axes[row, i].add_patch(circle)
+        axes[0, i].set_title(f"#{idx}", fontsize=8)
+    fig.suptitle(f"Raw frames — red circle = detected ball ({n_valid}/{N} found)", fontsize=12)
     plt.tight_layout()
-    plt.savefig(save_dir / "ball_detection_verify.png", dpi=150)
+    plt.savefig(save_dir / "raw_frames.png", dpi=150)
     plt.close()
-    print(f"  Saved: ball_detection_verify.png")
+    print(f"  Saved: raw_frames.png")
 
-    # Also save some frames where ball was NOT found for comparison
-    invalid_indices = (~ball_valid).nonzero(as_tuple=True)[0]
-    if len(invalid_indices) > 0:
-        n_no_ball = min(10, len(invalid_indices))
-        sample_no = invalid_indices[torch.linspace(0, len(invalid_indices) - 1, n_no_ball).long()]
-        fig, axes = plt.subplots(1, n_no_ball, figsize=(2.5 * n_no_ball, 2.5))
-        if n_no_ball == 1:
-            axes = [axes]
-        for i in range(n_no_ball):
-            idx = sample_no[i].item()
+    # ── Save ball detection verification ──
+    valid_indices = ball_valid.nonzero(as_tuple=True)[0]
+
+    if n_valid > 0:
+        print("  Saving ball detection verification...")
+        if len(valid_indices) > 20:
+            sample_idx = valid_indices[torch.linspace(0, len(valid_indices) - 1, 20).long()]
+        else:
+            sample_idx = valid_indices
+
+        n_show = len(sample_idx)
+        cols = min(10, n_show)
+        rows = max(1, (n_show + cols - 1) // cols)
+        fig, axes = plt.subplots(rows, cols, figsize=(2.5 * cols, 2.5 * rows))
+        axes = np.array(axes).reshape(-1)
+        for ax in axes:
+            ax.axis("off")
+        for i in range(n_show):
+            idx = sample_idx[i].item()
             img = frame_to_img(obs_all[idx, -1].cpu())
             axes[i].imshow(img, cmap="gray", vmin=0, vmax=255)
-            axes[i].axis("off")
+            r, c = ball_pos[idx, 0].item(), ball_pos[idx, 1].item()
+            circle = Circle((c, r), radius=3, fill=False, edgecolor="red", linewidth=2)
+            axes[i].add_patch(circle)
             axes[i].set_title(f"#{idx}", fontsize=8)
-        fig.suptitle("Frames where ball was NOT detected", fontsize=13)
+        fig.suptitle(f"Ball detection verification ({n_valid}/{N} found)", fontsize=13)
         plt.tight_layout()
-        plt.savefig(save_dir / "no_ball_frames.png", dpi=150)
+        plt.savefig(save_dir / "ball_detection_verify.png", dpi=150)
         plt.close()
-        print(f"  Saved: no_ball_frames.png")
+        print(f"  Saved: ball_detection_verify.png")
+    else:
+        print("  WARNING: No balls detected! Check raw_frames.png to debug.")
 
     # ═══════════════════════════════════════════════
     # TEST 1: Decoder reconstruction with ball markers
@@ -299,14 +336,16 @@ def main():
         optimizer_plain.step()
         losses_plain.append(loss.item())
 
-    # 3-row comparison: real / fg-weighted / plain — only frames with ball detected
-    print("  Saving decoder comparison (ball-present frames)...")
+    # 3-row comparison: real / fg-weighted / plain
+    print("  Saving decoder comparison...")
     with torch.no_grad():
         if n_valid >= 10:
-            # Pick 10 evenly spaced frames where ball was detected
             show_idx = valid_indices[torch.linspace(0, len(valid_indices) - 1, 10).long()]
-        else:
+        elif n_valid > 0:
             show_idx = valid_indices[:n_valid]
+        else:
+            # No ball detected — just show evenly spaced frames
+            show_idx = torch.linspace(0, N - 1, 10).long()
 
         n = len(show_idx)
         obs_show = obs_all[show_idx]
@@ -343,11 +382,13 @@ def main():
     plt.close()
     print(f"  Saved: decoder_comparison.png")
 
-    # Zoomed ball region comparison
-    print("  Saving zoomed ball region comparison...")
+    # Zoomed ball region comparison (only if balls detected)
+    if n_valid > 0:
+        print("  Saving zoomed ball region comparison...")
     zoom_r = 8  # zoom radius in pixels
-    n_zoom = min(8, n)
-    fig, axes = plt.subplots(3, n_zoom, figsize=(3 * n_zoom, 9))
+    n_zoom = min(8, n) if n_valid > 0 else 0
+    if n_zoom > 0:
+        fig, axes = plt.subplots(3, n_zoom, figsize=(3 * n_zoom, 9))
     for i in range(n_zoom):
         fr_idx = show_idx[i].item()
         bp = ball_pos[fr_idx]
@@ -373,11 +414,12 @@ def main():
             if i == 0:
                 axes[row, i].set_ylabel(label, fontsize=12)
 
-    fig.suptitle(f"Zoomed {zoom_r * 2}x{zoom_r * 2} region around ball", fontsize=13)
-    plt.tight_layout()
-    plt.savefig(save_dir / "ball_zoom_comparison.png", dpi=200)
-    plt.close()
-    print(f"  Saved: ball_zoom_comparison.png")
+    if n_zoom > 0:
+        fig.suptitle(f"Zoomed {zoom_r * 2}x{zoom_r * 2} region around ball", fontsize=13)
+        plt.tight_layout()
+        plt.savefig(save_dir / "ball_zoom_comparison.png", dpi=200)
+        plt.close()
+        print(f"  Saved: ball_zoom_comparison.png")
 
     # ═══════════════════════════════════════════════
     # TEST 2: Linear ball position probe

@@ -63,11 +63,12 @@ def collect_observations(env_name, n_frames, n_obs=4096, seed=42):
     return np.stack(obs_list, axis=0)
 
 
-def find_ball_pixel(frame):
+def find_ball_pixel(frame, debug=False):
     """Find ball position in a single 64x64 Pong frame.
 
     Args:
         frame: (H, W) tensor, normalized to [-0.5, 0.5]
+        debug: print detailed detection info
 
     Returns:
         (row, col) tuple in pixels, or None if no ball found.
@@ -75,15 +76,21 @@ def find_ball_pixel(frame):
     Method: find all bright pixels below the score area, then separate the
     ball from paddles by shape — paddles are tall vertical bars (many bright
     pixels in the same column), the ball is small (1-2 pixels per column).
-    No hardcoded column positions needed.
+    Then cluster remaining pixels and pick the smallest compact cluster.
     """
     H, W = frame.shape
 
     # Step 1: find all bright pixels in playfield (below score)
     playfield = frame[SCORE_ROWS:, :]  # (H-12, W)
-    thresh = playfield.mean() + 2.0 * playfield.std()
+    pf_mean = playfield.mean()
+    pf_std = playfield.std()
+    thresh = pf_mean + 2.0 * pf_std
     bright = playfield > thresh
     bright_coords = bright.nonzero(as_tuple=False)  # (K, 2) — row, col in playfield coords
+
+    if debug:
+        print(f"      playfield mean={pf_mean:.3f} std={pf_std:.3f} thresh={thresh:.3f}")
+        print(f"      bright pixels: {len(bright_coords)}")
 
     if len(bright_coords) < 1:
         return None
@@ -93,8 +100,12 @@ def find_ball_pixel(frame):
     for _, c in bright_coords:
         col_counts[c] += 1
 
-    # Paddle columns: >= 4 bright pixels vertically (paddles are ~8-15px tall at 64x64)
-    paddle_cols = col_counts >= 4
+    # Paddle columns: >= 3 bright pixels vertically
+    paddle_cols = col_counts >= 3
+
+    if debug:
+        paddle_col_list = paddle_cols.nonzero(as_tuple=True)[0].tolist()
+        print(f"      paddle columns (>=3 bright): {paddle_col_list}")
 
     # Step 3: filter out paddle pixels — keep only pixels in non-paddle columns
     ball_candidates = []
@@ -102,20 +113,61 @@ def find_ball_pixel(frame):
         if not paddle_cols[c]:
             ball_candidates.append((r.item(), c.item()))
 
+    if debug:
+        print(f"      non-paddle candidates: {len(ball_candidates)}")
+        if ball_candidates:
+            print(f"      candidate positions: {ball_candidates[:20]}")
+
     if len(ball_candidates) == 0:
         return None
 
-    # Step 4: ball should be a small cluster (1-6 pixels)
-    if len(ball_candidates) > 12:
-        return None  # too many non-paddle bright pixels, ambiguous
-
-    # Check compactness
+    # Step 4: cluster candidates by proximity and find the ball cluster
     coords = torch.tensor(ball_candidates, dtype=torch.float32)
-    center = coords.mean(dim=0)
-    if len(ball_candidates) > 1:
-        dists = (coords - center).pow(2).sum(dim=1).sqrt()
-        if dists.max() > 4:
-            return None  # scattered, not a single ball
+
+    # Simple greedy clustering: group pixels within distance 3 of each other
+    clusters = []
+    used = set()
+    for i in range(len(coords)):
+        if i in used:
+            continue
+        cluster = [i]
+        used.add(i)
+        for j in range(i + 1, len(coords)):
+            if j in used:
+                continue
+            # Check if pixel j is close to any pixel already in cluster
+            for k in cluster:
+                dist = (coords[j] - coords[k]).pow(2).sum().sqrt().item()
+                if dist <= 3:
+                    cluster.append(j)
+                    used.add(j)
+                    break
+        clusters.append(cluster)
+
+    if debug:
+        print(f"      clusters found: {len(clusters)}, sizes: {[len(c) for c in clusters]}")
+
+    # Ball is the smallest compact cluster (1-6 pixels)
+    best = None
+    for cluster in clusters:
+        if len(cluster) > 8:
+            continue  # too big for a ball
+        c_coords = coords[cluster]
+        center = c_coords.mean(dim=0)
+        # Check compactness
+        if len(cluster) > 1:
+            dists = (c_coords - center).pow(2).sum(dim=1).sqrt()
+            if dists.max() > 4:
+                continue
+        if best is None or len(cluster) < len(best):
+            best = cluster
+
+    if best is None:
+        return None
+
+    center = coords[best].mean(dim=0)
+    if debug:
+        print(f"      ball cluster size={len(best)}, center=({center[0].item():.1f}, {center[1].item():.1f})")
 
     # Return in full-frame coordinates (add SCORE_ROWS offset to row)
     return (center[0].item() + SCORE_ROWS, center[1].item())
@@ -137,20 +189,15 @@ def detect_all_balls(obs, debug=False):
 
     for i in range(N):
         frame = obs[i, -1]  # newest frame in stack
-        result = find_ball_pixel(frame)
+        do_debug = debug and i < 8
+        if do_debug:
+            print(f"    frame {i}:")
+        result = find_ball_pixel(frame, debug=do_debug)
         if result is not None:
             positions[i, 0] = result[0]
             positions[i, 1] = result[1]
-
-        if debug and i < 5:
-            H, W = frame.shape
-            region_mask = torch.zeros(H, W, dtype=torch.bool)
-            region_mask[SCORE_ROWS:, :] = True
-            region_mask[:, :PADDLE_L_MAX] = False
-            region_mask[:, PADDLE_R_MIN:] = False
-            rv = frame[region_mask]
-            print(f"    frame {i}: region min={rv.min():.3f} mean={rv.mean():.3f} "
-                  f"max={rv.max():.3f} std={rv.std():.3f} | ball={'found' if result else 'none'}")
+        if do_debug:
+            print(f"      result: {'found at ({:.1f}, {:.1f})'.format(*result) if result else 'none'}")
 
     valid = ~torch.isnan(positions[:, 0])
     return positions, valid

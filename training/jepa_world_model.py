@@ -226,9 +226,23 @@ class JEPAWorldModel(nn.Module):
             "cont": cont_loss,
             "aux_recon": aux_recon_loss,
         }
+        # ── Inline diagnostics (cheap stats on existing tensors) ──
+        with torch.no_grad():
+            diag = {
+                "emb_mean": embeddings.mean().item(),
+                "emb_std": embeddings.std().item(),
+                "pred_cosine": F.cosine_similarity(
+                    pred, pred_target, dim=-1
+                ).mean().item(),
+                "reward_pred_sparsity": (
+                    reward_pred.abs() < 0.1
+                ).float().mean().item(),
+            }
+
         info = {
             "emb_seq": embeddings.detach(),
             "dones": dones,
+            "diagnostics": diag,
         }
         return losses, info
 

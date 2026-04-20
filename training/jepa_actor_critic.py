@@ -256,6 +256,15 @@ class JEPAActorCriticTrainer:
         # ── EMA update target critic ──
         self._update_target_critic()
 
+        # ── Rollout health diagnostics ──
+        with torch.no_grad():
+            imag_norm_start = emb_imag[:, 0].norm(dim=-1).mean().item()
+            imag_norm_end = emb_imag[:, -1].norm(dim=-1).mean().item()
+            return_scale = (
+                (self._return_ema_high - self._return_ema_low).item()
+                if self._return_ema_low is not None else 0.0
+            )
+
         return {
             "actor_loss": actor_loss.item(),
             "critic_loss": critic_loss.item(),
@@ -265,6 +274,9 @@ class JEPAActorCriticTrainer:
             "cont_mean": conts.mean().item(),
             "actor_grad_norm": actor_grad.item(),
             "critic_grad_norm": critic_grad.item(),
+            "imag_emb_norm_start": imag_norm_start,
+            "imag_emb_norm_end": imag_norm_end,
+            "return_scale": return_scale,
         }
 
 

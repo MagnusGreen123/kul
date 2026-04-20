@@ -364,8 +364,12 @@ def main():
                 else:
                     ac_losses = {}
 
+                # Extract inline diagnostics from world model info
+                diag = wm_info.get("diagnostics", {})
+
                 all_losses = {**{f"wm/{k}": v for k, v in wm_losses.items()},
-                              **{f"ac/{k}": v for k, v in ac_losses.items()}}
+                              **{f"ac/{k}": v for k, v in ac_losses.items()},
+                              **{f"diag/{k}": v for k, v in diag.items()}}
                 for k, v in all_losses.items():
                     accumulated.setdefault(k, []).append(v)
 

@@ -2,9 +2,12 @@
 Detailed JEPA embedding probe — reveals what the encoder actually captures.
 
 Three complementary tests:
-  1. FG-weighted decoder: reconstructs with fg_weight=50, same as training
-  2. Linear ball locator: predicts ball (x,y) from embedding — cleanest test
-  3. Per-region MSE breakdown: foreground vs background reconstruction quality
+  1. FG-weighted decoder vs plain: side-by-side with ball markers
+  2. Linear ball locator: predicts ball (x,y) from embedding with validation overlay
+  3. Per-region MSE breakdown: score / paddles / playfield / ball-area
+
+Ball detection uses direct bright-pixel detection in the playfield area,
+not temporal diff (which catches paddle movement and score changes too).
 
 Usage:
     python probe_jepa_detailed.py --checkpoint checkpoints/step_200000.pt \
@@ -23,10 +26,26 @@ import yaml
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 
 from envs.wrappers import make_atari_env
 from models.decoder import ConvDecoder
 from training.jepa_world_model import JEPAWorldModel
+
+
+# ── Pong layout at 64x64 ──
+# Original Pong: 210x160, resized to 64x64
+# Score area:    rows 0-11
+# Playfield:     rows 12-63
+# Left paddle:   cols 4-7 (agent paddle, ~2px wide after resize)
+# Right paddle:  cols 56-59 (opponent paddle)
+# Center line:   col ~32 (dashed)
+# Ball:          ~1-2px, anywhere in playfield
+
+SCORE_ROWS = 12        # top rows reserved for score display
+PADDLE_L_MAX = 10      # left paddle region ends here
+PADDLE_R_MIN = 54      # right paddle region starts here
+CENTER_COL = 32        # center dashed line
 
 
 def collect_observations(env_name, n_frames, n_obs=4096, seed=42):
@@ -44,64 +63,77 @@ def collect_observations(env_name, n_frames, n_obs=4096, seed=42):
     return np.stack(obs_list, axis=0)
 
 
-def compute_fg_mask(obs):
-    """Foreground mask via temporal diff (same as training)."""
-    # obs: (N, C, H, W)
-    prev = torch.cat([obs[:1], obs[:-1]], dim=0)
-    diff = (obs - prev).abs()
-    fg = diff.mean(dim=1, keepdim=True)  # (N, 1, H, W)
-    return fg
+def find_ball_pixel(frame):
+    """Find ball position in a single 64x64 Pong frame.
 
+    Args:
+        frame: (H, W) tensor, normalized to [-0.5, 0.5]
 
-def find_ball_positions(obs):
-    """Heuristic ball detector for Pong: small bright moving object.
-    Returns (N, 2) with (row, col) normalized to [0,1], or NaN if no ball found.
+    Returns:
+        (row, col) tuple in pixels, or None if no ball found.
+
+    Method: find bright pixels in the playfield that are NOT paddles or center line.
+    The ball is the only small bright object in the mid-playfield region.
     """
-    N, C, H, W = obs.shape
+    H, W = frame.shape
+
+    # Bright pixel threshold — background is ~-0.3, objects are > -0.1
+    bright = frame > -0.1
+
+    # Mask out non-ball regions
+    mask = torch.zeros_like(bright)
+    # Playfield only (no score area)
+    mask[SCORE_ROWS:, :] = True
+    # Exclude paddle columns
+    mask[:, :PADDLE_L_MAX] = False
+    mask[:, PADDLE_R_MIN:] = False
+    # Exclude center line region (col 31-33)
+    mask[:, CENTER_COL - 1:CENTER_COL + 2] = False
+
+    candidates = (bright & mask).nonzero(as_tuple=False)  # (K, 2)
+
+    if len(candidates) == 0:
+        return None
+
+    # Ball should be a small cluster (1-6 pixels after resize)
+    # If too many bright pixels in playfield, something is wrong
+    if len(candidates) > 15:
+        return None
+
+    # Centroid of the candidate pixels
+    center_row = candidates[:, 0].float().mean().item()
+    center_col = candidates[:, 1].float().mean().item()
+    return (center_row, center_col)
+
+
+def detect_all_balls(obs):
+    """Detect ball in all frames. Uses the newest frame (last channel).
+
+    Args:
+        obs: (N, C, H, W) tensor
+
+    Returns:
+        positions: (N, 2) tensor with (row, col) in pixels, NaN if not found
+        valid_mask: (N,) bool tensor
+    """
+    N = obs.shape[0]
     positions = torch.full((N, 2), float("nan"))
 
-    for i in range(1, N):
-        # temporal diff on last channel (most recent frame)
-        diff = (obs[i, -1] - obs[i - 1, -1]).abs()
+    for i in range(N):
+        frame = obs[i, -1]  # newest frame in stack
+        result = find_ball_pixel(frame)
+        if result is not None:
+            positions[i, 0] = result[0]
+            positions[i, 1] = result[1]
 
-        # Ball is small and bright in diff — threshold
-        mask = diff > 0.15
-        # Exclude score area (top ~15 rows) and paddle columns (left/right edges)
-        mask[:15, :] = False
-        mask[:, :8] = False
-        mask[:, -8:] = False
-
-        coords = mask.nonzero(as_tuple=False)  # (K, 2) — row, col
-        if len(coords) >= 1 and len(coords) <= 20:
-            # Average position of the moving pixels = ball center
-            center = coords.float().mean(dim=0)
-            positions[i, 0] = center[0] / H  # row normalized
-            positions[i, 1] = center[1] / W  # col normalized
-
-    return positions
+    valid = ~torch.isnan(positions[:, 0])
+    return positions, valid
 
 
-def save_grid(real, recon, save_path, title=None, n=10):
-    """Save top=real, bottom=recon comparison grid."""
-    real = real[:n, 0].cpu().numpy()
-    recon = recon[:n, 0].detach().cpu().numpy()
-    real = np.clip((real + 0.5) * 255, 0, 255).astype(np.uint8)
-    recon = np.clip((recon + 0.5) * 255, 0, 255).astype(np.uint8)
-
-    fig, axes = plt.subplots(2, n, figsize=(2 * n, 4))
-    for i in range(n):
-        axes[0, i].imshow(real[i], cmap="gray", vmin=0, vmax=255)
-        axes[0, i].axis("off")
-        axes[1, i].imshow(recon[i], cmap="gray", vmin=0, vmax=255)
-        axes[1, i].axis("off")
-    axes[0, 0].set_ylabel("Real", fontsize=12)
-    axes[1, 0].set_ylabel("Recon", fontsize=12)
-    if title:
-        fig.suptitle(title, fontsize=14)
-    plt.tight_layout()
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=150)
-    plt.close()
+def frame_to_img(frame_tensor):
+    """Convert [-0.5, 0.5] tensor to [0, 255] uint8 numpy for display."""
+    img = frame_tensor.detach().cpu().numpy()
+    return np.clip((img + 0.5) * 255, 0, 255).astype(np.uint8)
 
 
 def main():
@@ -137,7 +169,7 @@ def main():
     print(f"Collecting {args.n_obs} observations...")
     obs_np = collect_observations(cfg["env"], n_frames=obs_channels, n_obs=args.n_obs)
     obs_all = torch.tensor(obs_np, dtype=torch.float32, device=device)
-    N = obs_all.shape[0]
+    N, C, H, W = obs_all.shape
     print(f"  obs: {obs_all.shape}, range [{obs_all.min():.2f}, {obs_all.max():.2f}]")
 
     save_dir = Path(args.save_dir)
@@ -148,23 +180,84 @@ def main():
     all_emb = []
     with torch.no_grad():
         for i in range(0, N, 256):
-            all_emb.append(wm.encode(obs_all[i:i+256]))
+            all_emb.append(wm.encode(obs_all[i:i + 256]))
     all_emb = torch.cat(all_emb, dim=0)
     print(f"  emb: {all_emb.shape}, mean={all_emb.mean():.4f}, std={all_emb.std():.4f}")
 
-    # ═══════════════════════════════════════════════
-    # TEST 1: FG-weighted decoder probe
-    # ═══════════════════════════════════════════════
-    print(f"\n{'='*50}")
-    print(f"TEST 1: FG-weighted decoder (fg_weight={fg_weight})")
-    print(f"{'='*50}")
+    # ── Detect ball in all frames ──
+    print("\nDetecting ball positions (pixel-based)...")
+    ball_pos, ball_valid = detect_all_balls(obs_all.cpu())
+    n_valid = ball_valid.sum().item()
+    print(f"  Found ball in {n_valid}/{N} frames ({100 * n_valid / N:.1f}%)")
 
+    # ── Save ball detection verification ──
+    # Show 20 frames where ball was detected, with red circle markers
+    print("  Saving ball detection verification...")
+    valid_indices = ball_valid.nonzero(as_tuple=True)[0]
+    # Sample evenly from valid frames
+    if len(valid_indices) > 20:
+        sample_idx = valid_indices[torch.linspace(0, len(valid_indices) - 1, 20).long()]
+    else:
+        sample_idx = valid_indices[:20]
+
+    n_show = min(20, len(sample_idx))
+    cols = 10
+    rows = (n_show + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(2.5 * cols, 2.5 * rows))
+    axes = np.array(axes).reshape(-1)
+    for ax in axes:
+        ax.axis("off")
+    for i in range(n_show):
+        idx = sample_idx[i].item()
+        img = frame_to_img(obs_all[idx, -1].cpu())
+        axes[i].imshow(img, cmap="gray", vmin=0, vmax=255)
+        # Mark detected ball with red circle
+        r, c = ball_pos[idx, 0].item(), ball_pos[idx, 1].item()
+        circle = Circle((c, r), radius=3, fill=False, edgecolor="red", linewidth=2)
+        axes[i].add_patch(circle)
+        axes[i].set_title(f"#{idx}", fontsize=8)
+    fig.suptitle(f"Ball detection verification ({n_valid}/{N} found)", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(save_dir / "ball_detection_verify.png", dpi=150)
+    plt.close()
+    print(f"  Saved: ball_detection_verify.png")
+
+    # Also save some frames where ball was NOT found for comparison
+    invalid_indices = (~ball_valid).nonzero(as_tuple=True)[0]
+    if len(invalid_indices) > 0:
+        n_no_ball = min(10, len(invalid_indices))
+        sample_no = invalid_indices[torch.linspace(0, len(invalid_indices) - 1, n_no_ball).long()]
+        fig, axes = plt.subplots(1, n_no_ball, figsize=(2.5 * n_no_ball, 2.5))
+        if n_no_ball == 1:
+            axes = [axes]
+        for i in range(n_no_ball):
+            idx = sample_no[i].item()
+            img = frame_to_img(obs_all[idx, -1].cpu())
+            axes[i].imshow(img, cmap="gray", vmin=0, vmax=255)
+            axes[i].axis("off")
+            axes[i].set_title(f"#{idx}", fontsize=8)
+        fig.suptitle("Frames where ball was NOT detected", fontsize=13)
+        plt.tight_layout()
+        plt.savefig(save_dir / "no_ball_frames.png", dpi=150)
+        plt.close()
+        print(f"  Saved: no_ball_frames.png")
+
+    # ═══════════════════════════════════════════════
+    # TEST 1: Decoder reconstruction with ball markers
+    # ═══════════════════════════════════════════════
+    print(f"\n{'=' * 50}")
+    print(f"TEST 1: Decoder reconstruction (fg_weight={fg_weight} vs plain)")
+    print(f"{'=' * 50}")
+
+    # Train FG-weighted decoder
     fg_decoder = ConvDecoder(
         latent_dim=embed_dim, out_channels=obs_channels, depth=args.decoder_depth
     ).to(device)
     optimizer_fg = torch.optim.Adam(fg_decoder.parameters(), lr=args.lr)
 
-    fg_mask_all = compute_fg_mask(obs_all)  # (N, 1, H, W)
+    # FG mask via temporal diff (same method as training)
+    prev_obs = torch.cat([obs_all[:1], obs_all[:-1]], dim=0)
+    fg_mask_all = (obs_all - prev_obs).abs().mean(dim=1, keepdim=True)
 
     losses_fg = []
     for step in range(args.steps):
@@ -183,10 +276,10 @@ def main():
         losses_fg.append(loss.item())
 
         if (step + 1) % 200 == 0:
-            print(f"  step {step+1:4d} | fg_recon_loss: {np.mean(losses_fg[-200:]):.6f}")
+            print(f"  step {step + 1:4d} | fg_recon_loss: {np.mean(losses_fg[-200:]):.6f}")
 
-    # Also train a plain decoder for comparison
-    print(f"\n  Training plain decoder (no fg_weight) for comparison...")
+    # Train plain decoder
+    print("  Training plain decoder for comparison...")
     plain_decoder = ConvDecoder(
         latent_dim=embed_dim, out_channels=obs_channels, depth=args.decoder_depth
     ).to(device)
@@ -206,70 +299,115 @@ def main():
         optimizer_plain.step()
         losses_plain.append(loss.item())
 
-    # Save comparison images
+    # 3-row comparison: real / fg-weighted / plain — only frames with ball detected
+    print("  Saving decoder comparison (ball-present frames)...")
     with torch.no_grad():
-        # Pick frames where ball is visible (high fg_mask)
-        fg_score = fg_mask_all.mean(dim=(1, 2, 3))
-        _, ball_idx = fg_score.topk(20)
-        # Take every other to avoid consecutive near-duplicates
-        ball_idx = ball_idx[::2][:10]
+        if n_valid >= 10:
+            # Pick 10 evenly spaced frames where ball was detected
+            show_idx = valid_indices[torch.linspace(0, len(valid_indices) - 1, 10).long()]
+        else:
+            show_idx = valid_indices[:n_valid]
 
-        obs_sample = obs_all[ball_idx]
-        emb_sample = all_emb[ball_idx]
-        recon_fg = fg_decoder(emb_sample)
-        recon_plain = plain_decoder(emb_sample)
+        n = len(show_idx)
+        obs_show = obs_all[show_idx]
+        emb_show = all_emb[show_idx]
+        recon_fg = fg_decoder(emb_show)
+        recon_plain = plain_decoder(emb_show)
 
-    save_grid(obs_sample, recon_fg, save_dir / "fg_weighted_recon.png",
-              title=f"FG-weighted decoder (fg_weight={fg_weight})")
-    save_grid(obs_sample, recon_plain, save_dir / "plain_recon.png",
-              title="Plain decoder (no fg_weight)")
-
-    # 3-row comparison: real / fg-weighted / plain
-    n = min(10, len(ball_idx))
-    fig, axes = plt.subplots(3, n, figsize=(2 * n, 6))
+    fig, axes = plt.subplots(3, n, figsize=(3 * n, 9))
     for i in range(n):
+        fr_idx = show_idx[i].item()
+        bp = ball_pos[fr_idx]
+
         for row, (data, label) in enumerate([
-            (obs_sample, "Real"),
+            (obs_show, "Real"),
             (recon_fg, "FG-weighted"),
             (recon_plain, "Plain"),
         ]):
-            img = data[i, 0].detach().cpu().numpy()
-            img = np.clip((img + 0.5) * 255, 0, 255).astype(np.uint8)
+            img = frame_to_img(data[i, -1])  # newest frame channel
             axes[row, i].imshow(img, cmap="gray", vmin=0, vmax=255)
+            # Mark ball position on all rows
+            if not torch.isnan(bp[0]):
+                circle = Circle(
+                    (bp[1].item(), bp[0].item()),
+                    radius=3, fill=False, edgecolor="red", linewidth=1.5,
+                )
+                axes[row, i].add_patch(circle)
             axes[row, i].axis("off")
             if i == 0:
-                axes[row, i].set_ylabel(label, fontsize=11)
-    fig.suptitle("Frames with most foreground activity (ball movement)", fontsize=13)
+                axes[row, i].set_ylabel(label, fontsize=12)
+
+    fig.suptitle("Decoder comparison — red circle = detected ball position", fontsize=13)
     plt.tight_layout()
-    plt.savefig(save_dir / "fg_vs_plain_comparison.png", dpi=150)
+    plt.savefig(save_dir / "decoder_comparison.png", dpi=200)
     plt.close()
-    print(f"  Saved: fg_vs_plain_comparison.png")
+    print(f"  Saved: decoder_comparison.png")
+
+    # Zoomed ball region comparison
+    print("  Saving zoomed ball region comparison...")
+    zoom_r = 8  # zoom radius in pixels
+    n_zoom = min(8, n)
+    fig, axes = plt.subplots(3, n_zoom, figsize=(3 * n_zoom, 9))
+    for i in range(n_zoom):
+        fr_idx = show_idx[i].item()
+        bp = ball_pos[fr_idx]
+        if torch.isnan(bp[0]):
+            continue
+        r, c = int(bp[0].item()), int(bp[1].item())
+        r0 = max(0, r - zoom_r)
+        r1 = min(H, r + zoom_r)
+        c0 = max(0, c - zoom_r)
+        c1 = min(W, c + zoom_r)
+
+        for row, (data, label) in enumerate([
+            (obs_show, "Real"),
+            (recon_fg, "FG-weighted"),
+            (recon_plain, "Plain"),
+        ]):
+            patch = frame_to_img(data[i, -1])[r0:r1, c0:c1]
+            axes[row, i].imshow(patch, cmap="gray", vmin=0, vmax=255,
+                                interpolation="nearest")
+            # Mark ball center
+            axes[row, i].plot(c - c0, r - r0, "r+", markersize=10, markeredgewidth=2)
+            axes[row, i].axis("off")
+            if i == 0:
+                axes[row, i].set_ylabel(label, fontsize=12)
+
+    fig.suptitle(f"Zoomed {zoom_r * 2}x{zoom_r * 2} region around ball", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(save_dir / "ball_zoom_comparison.png", dpi=200)
+    plt.close()
+    print(f"  Saved: ball_zoom_comparison.png")
 
     # ═══════════════════════════════════════════════
     # TEST 2: Linear ball position probe
     # ═══════════════════════════════════════════════
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print("TEST 2: Linear ball position probe")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
-    ball_pos = find_ball_positions(obs_all.cpu())
-    valid = ~torch.isnan(ball_pos[:, 0])
-    n_valid = valid.sum().item()
-    print(f"  Found ball in {n_valid}/{N} frames ({100*n_valid/N:.1f}%)")
+    if n_valid < 100:
+        print("  Not enough ball detections for position probe")
+        mean_px_err = float("nan")
+    else:
+        # Normalize positions to [0, 1]
+        norm_pos = ball_pos.clone()
+        norm_pos[:, 0] /= H
+        norm_pos[:, 1] /= W
 
-    if n_valid > 100:
-        # Train linear probe: embedding -> (row, col)
+        valid_emb = all_emb[ball_valid]
+        valid_pos = norm_pos[ball_valid].to(device)
+
+        # Train/test split (shuffle to avoid temporal correlation)
+        perm = torch.randperm(len(valid_emb))
+        n_train = int(0.8 * len(valid_emb))
+        train_emb = valid_emb[perm[:n_train]]
+        train_pos = valid_pos[perm[:n_train]]
+        test_emb = valid_emb[perm[n_train:]]
+        test_pos = valid_pos[perm[n_train:]]
+
         ball_probe = nn.Linear(embed_dim, 2).to(device)
         optimizer_ball = torch.optim.Adam(ball_probe.parameters(), lr=1e-3)
-
-        valid_idx = valid.nonzero(as_tuple=True)[0]
-        valid_emb = all_emb[valid_idx]
-        valid_pos = ball_pos[valid_idx].to(device)
-
-        # Train/test split
-        n_train = int(0.8 * len(valid_idx))
-        train_emb, test_emb = valid_emb[:n_train], valid_emb[n_train:]
-        train_pos, test_pos = valid_pos[:n_train], valid_pos[n_train:]
 
         losses_ball = []
         for step in range(2000):
@@ -283,35 +421,33 @@ def main():
             losses_ball.append(loss.item())
 
             if (step + 1) % 500 == 0:
-                print(f"  step {step+1:4d} | ball_pos_mse: {np.mean(losses_ball[-500:]):.6f}")
+                print(f"  step {step + 1:4d} | ball_pos_mse: {np.mean(losses_ball[-500:]):.6f}")
 
-        # Evaluate on test set
+        # Evaluate
         with torch.no_grad():
             test_pred = ball_probe(test_emb)
             test_mse = F.mse_loss(test_pred, test_pos).item()
-            # Error in pixels (64x64 grid)
             pixel_err = ((test_pred - test_pos) * 64).pow(2).sum(dim=1).sqrt()
             mean_px_err = pixel_err.mean().item()
             median_px_err = pixel_err.median().item()
 
-        print(f"\n  Test MSE: {test_mse:.6f}")
-        print(f"  Mean pixel error:   {mean_px_err:.1f} px (of 64)")
-        print(f"  Median pixel error: {median_px_err:.1f} px (of 64)")
+        print(f"\n  Test MSE:            {test_mse:.6f}")
+        print(f"  Mean pixel error:    {mean_px_err:.1f} px (of 64)")
+        print(f"  Median pixel error:  {median_px_err:.1f} px (of 64)")
 
         if mean_px_err < 5:
-            print("  GOOD: Embedding accurately encodes ball position")
+            print("  RESULT: Embedding accurately encodes ball position")
         elif mean_px_err < 15:
-            print("  PARTIAL: Embedding has rough ball position info")
+            print("  RESULT: Embedding has rough ball position info")
         else:
-            print("  POOR: Embedding does not reliably encode ball position")
+            print("  RESULT: Embedding does NOT reliably encode ball position")
 
-        # Scatter plot: predicted vs actual ball position
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        # Scatter plot
         tp = test_pos.cpu().numpy()
         pp = test_pred.cpu().numpy()
-
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
         for ax, dim, label in [(axes[0], 0, "Row (Y)"), (axes[1], 1, "Col (X)")]:
-            ax.scatter(tp[:, dim], pp[:, dim], alpha=0.3, s=10)
+            ax.scatter(tp[:, dim], pp[:, dim], alpha=0.3, s=10, c="steelblue")
             ax.plot([0, 1], [0, 1], "r--", linewidth=1)
             ax.set_xlabel(f"Actual {label}")
             ax.set_ylabel(f"Predicted {label}")
@@ -319,45 +455,75 @@ def main():
             ax.set_xlim(0, 1)
             ax.set_ylim(0, 1)
             ax.set_aspect("equal")
-
-        fig.suptitle(f"Linear Ball Position Probe (mean err: {mean_px_err:.1f}px)", fontsize=13)
+        fig.suptitle(f"Linear Ball Probe — mean err: {mean_px_err:.1f}px, median: {median_px_err:.1f}px",
+                     fontsize=13)
         plt.tight_layout()
         plt.savefig(save_dir / "ball_position_probe.png", dpi=150)
         plt.close()
         print(f"  Saved: ball_position_probe.png")
-    else:
-        print("  Not enough ball detections for position probe")
+
+        # Overlay: show predicted vs actual on real frames
+        print("  Saving prediction overlay...")
+        test_indices = perm[n_train:]
+        orig_indices = ball_valid.nonzero(as_tuple=True)[0][test_indices]
+        n_overlay = min(10, len(orig_indices))
+        overlay_idx = torch.linspace(0, len(orig_indices) - 1, n_overlay).long()
+
+        fig, axes = plt.subplots(1, n_overlay, figsize=(3 * n_overlay, 3))
+        if n_overlay == 1:
+            axes = [axes]
+        for i in range(n_overlay):
+            oi = overlay_idx[i]
+            fr_idx = orig_indices[oi].item()
+            img = frame_to_img(obs_all[fr_idx, -1].cpu())
+            axes[i].imshow(img, cmap="gray", vmin=0, vmax=255)
+
+            # Actual position (green)
+            ar, ac = test_pos[oi, 0].item() * H, test_pos[oi, 1].item() * W
+            # Predicted position (red)
+            pr, pc = test_pred[oi, 0].item() * H, test_pred[oi, 1].item() * W
+
+            axes[i].plot(ac, ar, "g+", markersize=12, markeredgewidth=2, label="Actual")
+            axes[i].plot(pc, pr, "rx", markersize=10, markeredgewidth=2, label="Predicted")
+            err = pixel_err[oi].item()
+            axes[i].set_title(f"err={err:.1f}px", fontsize=9)
+            axes[i].axis("off")
+            if i == 0:
+                axes[i].legend(fontsize=7, loc="lower left")
+
+        fig.suptitle("Ball position: green+=actual, red x=predicted from embedding", fontsize=12)
+        plt.tight_layout()
+        plt.savefig(save_dir / "ball_prediction_overlay.png", dpi=200)
+        plt.close()
+        print(f"  Saved: ball_prediction_overlay.png")
 
     # ═══════════════════════════════════════════════
     # TEST 3: Per-region MSE breakdown
     # ═══════════════════════════════════════════════
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print("TEST 3: Per-region MSE breakdown")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
     with torch.no_grad():
         recon_all_fg = []
         for i in range(0, N, 256):
-            recon_all_fg.append(fg_decoder(all_emb[i:i+256]))
+            recon_all_fg.append(fg_decoder(all_emb[i:i + 256]))
         recon_all_fg = torch.cat(recon_all_fg, dim=0)
 
-        sq_err = (obs_all - recon_all_fg) ** 2  # (N, C, H, W)
+        sq_err = (obs_all - recon_all_fg) ** 2
 
-        # Region masks (for 64x64 Pong frames)
-        H, W = obs_all.shape[2], obs_all.shape[3]
+        # Region masks
         score_mask = torch.zeros(1, 1, H, W, device=device)
-        score_mask[:, :, :12, :] = 1  # top 12 rows = score
+        score_mask[:, :, :SCORE_ROWS, :] = 1
 
         left_paddle = torch.zeros(1, 1, H, W, device=device)
-        left_paddle[:, :, 12:, :8] = 1
+        left_paddle[:, :, SCORE_ROWS:, :PADDLE_L_MAX] = 1
 
         right_paddle = torch.zeros(1, 1, H, W, device=device)
-        right_paddle[:, :, 12:, -8:] = 1
+        right_paddle[:, :, SCORE_ROWS:, PADDLE_R_MIN:] = 1
 
         playfield = torch.zeros(1, 1, H, W, device=device)
-        playfield[:, :, 12:, 8:-8] = 1  # middle area where ball moves
-
-        bg_mask = 1 - (score_mask + left_paddle + right_paddle + playfield).clamp(0, 1)
+        playfield[:, :, SCORE_ROWS:, PADDLE_L_MAX:PADDLE_R_MIN] = 1
 
         regions = {
             "Score area":    score_mask,
@@ -366,47 +532,67 @@ def main():
             "Playfield":     playfield,
         }
 
-        print(f"\n  {'Region':<20s}  {'MSE':>10s}  {'% of total':>10s}")
-        print(f"  {'-'*20}  {'-'*10}  {'-'*10}")
-        total_mse = sq_err.mean().item()
+        print(f"\n  {'Region':<20s}  {'MSE':>12s}")
+        print(f"  {'-' * 20}  {'-' * 12}")
         for name, mask in regions.items():
-            region_err = (sq_err * mask).sum() / mask.sum() / N / obs_channels
-            print(f"  {name:<20s}  {region_err.item():.6f}  {100*region_err.item()/total_mse:.1f}%")
+            region_err = (sq_err * mask).sum() / (mask.sum() * N * C)
+            print(f"  {name:<20s}  {region_err.item():.6f}")
 
-        # Foreground vs background
-        fg_err = (sq_err * (fg_mask_all > 0.05).float()).sum()
-        fg_pixels = (fg_mask_all > 0.05).float().sum()
-        bg_err = (sq_err * (fg_mask_all <= 0.05).float()).sum()
-        bg_pixels = (fg_mask_all <= 0.05).float().sum()
+        # Ball-area MSE: compute MSE specifically at ball locations
+        if n_valid >= 50:
+            ball_region_errs = []
+            for i in range(N):
+                if not ball_valid[i]:
+                    continue
+                r, c = int(ball_pos[i, 0].item()), int(ball_pos[i, 1].item())
+                r0, r1 = max(0, r - 2), min(H, r + 3)
+                c0, c1 = max(0, c - 2), min(W, c + 3)
+                ball_err = sq_err[i, :, r0:r1, c0:c1].mean().item()
+                ball_region_errs.append(ball_err)
 
-        fg_mse = (fg_err / fg_pixels).item() if fg_pixels > 0 else 0
-        bg_mse = (bg_err / bg_pixels).item() if bg_pixels > 0 else 0
+            ball_mse = np.mean(ball_region_errs)
+            bg_region = sq_err[:, :, SCORE_ROWS:, PADDLE_L_MAX:PADDLE_R_MIN]
+            bg_mse = bg_region.mean().item()
 
-        print(f"\n  {'Foreground (moving)':<20s}  {fg_mse:.6f}")
-        print(f"  {'Background (static)':<20s}  {bg_mse:.6f}")
-        print(f"  FG/BG ratio: {fg_mse/bg_mse:.1f}x" if bg_mse > 0 else "")
+            print(f"\n  {'Ball region (5x5)':<20s}  {ball_mse:.6f}")
+            print(f"  {'Playfield avg':<20s}  {bg_mse:.6f}")
+            ratio = ball_mse / bg_mse if bg_mse > 0 else float("inf")
+            print(f"  Ball/Playfield ratio: {ratio:.1f}x")
 
-        if fg_mse / bg_mse > 3:
-            print("  WARNING: Foreground much worse than background — ball likely not well encoded")
-        elif fg_mse / bg_mse > 1.5:
-            print("  PARTIAL: Foreground somewhat worse — ball partially captured")
+            if ratio < 2:
+                print("  GOOD: Ball region reconstructed as well as playfield")
+            elif ratio < 5:
+                print("  PARTIAL: Ball region somewhat worse than playfield")
+            else:
+                print("  POOR: Ball region much worse — ball not well captured")
         else:
-            print("  GOOD: Foreground quality close to background — moving objects well encoded")
+            ball_mse = float("nan")
+            bg_mse = float("nan")
+            ratio = float("nan")
+            print("\n  (not enough ball detections for ball-region analysis)")
 
     # ═══════════════════════════════════════════════
     # Summary
     # ═══════════════════════════════════════════════
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print("SUMMARY")
-    print(f"{'='*50}")
-    print(f"  Checkpoint: {args.checkpoint}")
-    print(f"  Embedding: mean={all_emb.mean():.3f}, std={all_emb.std():.3f}")
-    print(f"  FG-weighted recon loss: {np.mean(losses_fg[-100:]):.6f}")
-    print(f"  Plain recon loss:       {np.mean(losses_plain[-100:]):.6f}")
-    if n_valid > 100:
-        print(f"  Ball position error:    {mean_px_err:.1f}px (linear probe)")
-    print(f"  FG/BG MSE ratio:        {fg_mse/bg_mse:.1f}x")
-    print(f"\n  Results saved to: {save_dir}")
+    print(f"{'=' * 50}")
+    print(f"  Checkpoint:           {args.checkpoint}")
+    print(f"  Embedding:            mean={all_emb.mean():.3f}, std={all_emb.std():.3f}")
+    print(f"  Ball detected:        {n_valid}/{N} frames ({100 * n_valid / N:.1f}%)")
+    print(f"  FG-weighted recon:    {np.mean(losses_fg[-100:]):.6f}")
+    print(f"  Plain recon:          {np.mean(losses_plain[-100:]):.6f}")
+    if not np.isnan(mean_px_err):
+        print(f"  Ball position error:  {mean_px_err:.1f}px mean, {median_px_err:.1f}px median")
+    if not np.isnan(ratio):
+        print(f"  Ball/Playfield MSE:   {ratio:.1f}x")
+    print(f"\n  All images saved to: {save_dir}/")
+    print(f"  Key files:")
+    print(f"    ball_detection_verify.png  — verify ball detector works")
+    print(f"    decoder_comparison.png     — real vs fg-weighted vs plain")
+    print(f"    ball_zoom_comparison.png   — zoomed view around ball")
+    print(f"    ball_position_probe.png    — linear probe scatter plot")
+    print(f"    ball_prediction_overlay.png — predicted vs actual on frames")
 
 
 if __name__ == "__main__":

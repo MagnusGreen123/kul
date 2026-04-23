@@ -277,8 +277,16 @@ def main():
 
     collect_per_step = cfg.get("collect_per_step", 1000)
     ac_warmup_steps = cfg.get("ac_warmup_steps", 0)
-    if ac_warmup_steps > 0:
+    ac_gate_threshold = cfg.get("ac_gate_threshold", None)  # metric-gated AC start
+    if ac_gate_threshold is not None:
+        print(f"AC metric gate: waiting for wm/pred < {ac_gate_threshold} (min {ac_warmup_steps} steps)")
+        _pred_ema = None
+        _ac_gate_passed = False
+    elif ac_warmup_steps > 0:
         print(f"AC warmup: training only world model for first {ac_warmup_steps} steps")
+        _ac_gate_passed = True
+    else:
+        _ac_gate_passed = True
     _ac_warmup_logged = False
 
     # ── Prefill ──
@@ -354,9 +362,23 @@ def main():
 
                 wm_losses, wm_info = wm_trainer.train_step(batch)
 
-                if global_step >= ac_warmup_steps:
-                    if not _ac_warmup_logged and ac_warmup_steps > 0:
-                        print(f"AC warmup complete at step {global_step} — starting actor-critic training")
+                # ── AC gating: metric-based or fixed warmup ──
+                ac_ready = global_step >= ac_warmup_steps
+                if ac_ready and ac_gate_threshold is not None and not _ac_gate_passed:
+                    pred_val = wm_losses.get("pred", 1.0)
+                    if _pred_ema is None:
+                        _pred_ema = pred_val
+                    else:
+                        _pred_ema = 0.99 * _pred_ema + 0.01 * pred_val
+                    if _pred_ema < ac_gate_threshold:
+                        _ac_gate_passed = True
+                        print(f"AC gate passed at step {global_step}: wm/pred EMA = {_pred_ema:.6f} < {ac_gate_threshold}")
+                    else:
+                        ac_ready = False
+
+                if ac_ready and _ac_gate_passed:
+                    if not _ac_warmup_logged:
+                        print(f"AC training started at step {global_step}")
                         _ac_warmup_logged = True
                     ac_losses = ac_trainer.train_step(
                         wm_info["emb_seq"], dones=wm_info.get("dones")

@@ -86,7 +86,8 @@ class JEPAActorCriticTrainer:
         for p, tp in zip(self.critic.parameters(), self.target_critic.parameters()):
             tp.data.lerp_(p.data, tau)
 
-    def _normalize_returns(self, returns):
+    def _update_return_stats(self, returns):
+        """Update EMA of return distribution percentiles (call once per train step)."""
         with torch.no_grad():
             low = torch.quantile(returns, 0.05)
             high = torch.quantile(returns, 0.95)
@@ -97,9 +98,21 @@ class JEPAActorCriticTrainer:
                 decay = self._return_ema_decay
                 self._return_ema_low = decay * self._return_ema_low + (1 - decay) * low
                 self._return_ema_high = decay * self._return_ema_high + (1 - decay) * high
-            scale = (self._return_ema_high - self._return_ema_low).clamp(min=1.0)
-            offset = self._return_ema_low
+
+    def _return_scale_offset(self):
+        if self._return_ema_low is None:
+            return 1.0, 0.0
+        scale = (self._return_ema_high - self._return_ema_low).clamp(min=1.0)
+        return scale, self._return_ema_low
+
+    def _normalize_returns(self, returns):
+        scale, offset = self._return_scale_offset()
         return (returns - offset) / scale
+
+    def _denormalize_returns(self, normalized):
+        """Convert critic output (normalized space) back to symlog space."""
+        scale, offset = self._return_scale_offset()
+        return normalized * scale + offset
 
     def imagine_rollout(self, initial_emb):
         """Roll out in imagination using actor + predictor.
@@ -148,7 +161,10 @@ class JEPAActorCriticTrainer:
                 # stay bounded — symexp here caused a self-reinforcing
                 # value explosion (9740 when true value is ~-8).
                 reward = self.world_model.reward_pred(next_emb).clamp(-5, 5)
-                value = self.target_critic(next_emb).clamp(-10, 10)
+                # Critic predicts in normalized space; denormalize back
+                # to symlog for lambda-return computation (DreamerV3-style).
+                raw_value = self.target_critic(next_emb)
+                value = self._denormalize_returns(raw_value).clamp(-10, 10)
                 cont = torch.sigmoid(self.world_model.cont_pred(next_emb))
 
             emb_list.append(next_emb)
@@ -224,8 +240,12 @@ class JEPAActorCriticTrainer:
             rewards, values, self.gamma, self.lambda_, continuations=conts
         )
 
-        # ── Actor loss ── REINFORCE with return normalization
+        # ── Return normalization (DreamerV3-style) ──
+        # Update stats once, then normalize for both actor and critic.
+        self._update_return_stats(lambda_returns)
         normed_returns = self._normalize_returns(lambda_returns)
+
+        # ── Actor loss ── REINFORCE with normalized returns
         actor_loss = -(normed_returns.detach() * log_probs).mean() \
                      - self.entropy_coeff * entropies.mean()
 
@@ -243,9 +263,11 @@ class JEPAActorCriticTrainer:
         actor_grad = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_opt.step()
 
-        # ── Critic loss ── MSE on lambda-returns (already in symlog space)
+        # ── Critic loss ── MSE on normalized lambda-returns
+        # Critic predicts in normalized space; targets are normalized too.
+        # This prevents critic loss explosion during reward regime shifts.
         critic_values = self.critic(emb_imag.detach())
-        critic_target = lambda_returns.detach()
+        critic_target = normed_returns.detach()
         critic_loss = F.mse_loss(critic_values, critic_target)
 
         self.critic_opt.zero_grad()

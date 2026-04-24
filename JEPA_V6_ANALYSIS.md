@@ -212,7 +212,113 @@ Criticen starter med en moden world model (pred < 0.015), noe som eliminerer sø
 - Critic-stabiliseringen fra v7 forhindrer kollaps nar rewards gar positive
 - Malet er reward > +11 uten kollaps
 
+---
+
+## v8-resultater (Wandb ID: `qni5qgk3`, 501k steps, ~34 timer)
+
+### Treningsforlop
+
+v8 kombinerte v7s konservative critic-parametere med den nye metric-gaten. AC-treningen startet korrekt ved step ~140k nar wm/pred EMA passerte 0.015-thresholden.
+
+```
+Step    Reward   Value    Critic Loss  Critic Grad
+140k    -21      -0.12    0.023        0.08      ← AC gate passert, godt kalibrert
+184k    -16      -0.26    0.005        0.04      ← stabil, lav loss
+220k     -9      +0.01    0.006        0.06      ← begynner a drifte positiv
+252k    -17      +0.50    0.033        0.20      ← overestimering starter
+280k    -19      +2.38    0.269        1.04      ← massiv overestimering
+320k    -17      +4.57    0.256        1.34
+360k    -14      +5.09    0.289        1.70      ← peak reward
+501k    -19      +4.41    0.358        2.88      ← slutt
+```
+
+### Observasjoner
+
+**Metric-gaten fungerte perfekt.** AC startet ved step 140k med moden world model (pred=0.015). Criticen var godt kalibrert de forste 80k steppene av AC-trening (value≈-0.1 til -0.4 med lave tap).
+
+**Men v7s critic-parametere forarsaker kronisk value-overestimering.** Fra step 220k driftet value-estimatene gradvis oppover til +5.0 mens faktisk reward forble -17 til -20. Criticen var for treg (ema=0.995, LR=5e-5) til a korrigere overestimeringen.
+
+**Sammenligning med v6 er avgjorende.** v6 hadde noyaktig samme initielle overestimering etter resume (value=+4.4 ved step 216k), men de raske critic-parametrene (ema=0.98, LR=1e-4) korrigerte den til -2.5 innen ~20k steps. v8s critic driftet i same retning uten selvcorrection.
+
+### v8 vs v6 ved matchede steps
+
+```
+               v6 (fast critic, ema=0.98)    v8 (slow critic, ema=0.995)
+Step     Rew    Value    C_loss  C_grad   Rew    Value    C_loss  C_grad
+252k     -18    -2.51    0.040   0.72     -17    +0.50    0.033   0.20
+280k     -17    -1.48    0.025   0.54     -19    +2.38    0.269   1.04
+320k      -6    -0.59    0.013   0.37     -17    +4.57    0.256   1.34
+360k     -10    -0.11    0.014   0.33     -14    +5.09    0.289   1.70
+460k     +11    -0.64    0.076   0.65     -17    +4.73    0.297   1.58
+501k     -12    +1.97    0.330   2.00     -19    +4.41    0.358   2.88
+```
+
+### Konklusjon
+
+v8 bekrefter to ting:
+1. **Metric-gaten fungerer** — den eliminerer bootstrapping-problemet fra v7
+2. **v7s konservative critic-parametere er den dominerende flaskehalsen** — de forhindrer selvcorrection av value-overestimering
+
+Selve kollapsen i v6 var forarsaker av at criticen ikke taklet brå skift i return-distribusjonen (fra negativ til positiv reward). v7/v8 "løste" dette ved a bremse criticen, men dette skapte et verre problem: kronisk overestimering som aldri korrigeres.
+
+| Metrikk              | v6            | v7              | v8              |
+|----------------------|---------------|-----------------|-----------------|
+| Peak reward          | **+11**       | -8              | -14             |
+| Slutt-reward         | -12           | -19             | -19             |
+| Value ved 320k       | -0.59         | -0.76           | +4.57           |
+| Problemtype          | Brå kollaps   | Oscillering     | Kronisk overest.|
+| Gate?                | Nei (resume)  | Nei             | Ja              |
+| Critic speed         | Rask (0.98)   | Treg (0.995)    | Treg (0.995)    |
+
+---
+
+## v9-plan: Rask critic + gate + DreamerV3-stil return-normalisering
+
+### Hypotese
+
+v6 viste at rask critic gir god laering, men kollapser ved regime-overganger. v7/v8 viste at treg critic forhindrer kollaps men dreper laering. v9 tar en tredje tilnaerming: **rask critic som opererer i normalisert rom**.
+
+Kollapsmekansimen i v6 var spesifikt at critic-targets (lambda-returns i symlog-rom) skiftet bratt fra ~-3.7 til ~+2.5 nar agenten begynte a vinne. MSE-loss eksploderte fordi target-distribusjonen endret seg fundamentalt.
+
+DreamerV3 loser dette ved a la criticen operere i et **normalisert return-rom**: returns skaleres av lopende percentiler (5./95.) slik at critic-targets alltid er i omtrent [0, 1]-omradet, uavhengig av den underliggende reward-skalaen.
+
+### Implementasjon
+
+Tre endringer i `training/jepa_actor_critic.py`:
+
+**1. Refaktorert return-normalisering.** `_normalize_returns` er splittet i `_update_return_stats` (oppdaterer EMA en gang per steg), `_normalize_returns` (normaliserer), og `_denormalize_returns` (denormaliserer).
+
+**2. Critic trener pa normaliserte targets.** I stedet for rå symlog lambda-returns, trener criticen pa normaliserte returns. Dette betyr at critic-loss forblir stabil uavhengig av reward-skala:
+```python
+critic_target = normed_returns.detach()  # normalisert
+critic_loss = F.mse_loss(critic_values, critic_target)
+```
+
+**3. Target critic denormaliseres i imagination.** Nar target-criticens value-estimater brukes i lambda-return-beregningen, konverteres de tilbake til symlog-rom:
+```python
+raw_value = self.target_critic(next_emb)  # normalisert rom
+value = self._denormalize_returns(raw_value).clamp(-10, 10)  # tilbake til symlog
+```
+
+### Critic-parametere revertert til v6
+
+| Parameter        | v8      | v9      | Begrunnelse                         |
+|------------------|---------|---------|-------------------------------------|
+| critic_ema_decay | 0.995   | 0.98    | Rask target — return norm beskytter |
+| critic_grad_clip | 2.0     | 10.0    | Permissiv — norm forhindrer store g |
+| critic_lr        | 5.0e-5  | 1.0e-4  | Full LR — criticen ma reagere raskt |
+| ac_gate_threshold| 0.015   | 0.015   | Uendret fra v8                      |
+| Return norm      | Actor   | Actor+Critic | Ny: critic i normalisert rom   |
+
+### Forventet effekt
+
+- **140k-220k**: Gate sikrer god AC-start (som v8), rask critic holder seg kalibrert (som v6)
+- **220k-460k**: Jevn laering (som v6 fase 2), reward fra -17 mot +11
+- **460k+**: Ved regime-overgang er critic-loss stabil fordi targets er normalisert. Ingen MSE-eksplosjon, ingen value-overestimering, ingen kollaps
+
+Malet er a passere v6s peak (+11) og na RSSM v24-nivå (+19).
+
 ### Fremtidige versjoner
 
-- **v9**: Residual prediction (z_next = z_prev + Predictor(z_prev, a)). World model-endring, ortogonal til AC-endringene i v7/v8.
-- **v10+**: Vurdere lengre rollouts (2→4 step), evt. fjerne aux decoder.
+- **v10**: Residual prediction (z_next = z_prev + Predictor(z_prev, a)). World model-forbedring, ortogonal til v9s AC-endringer.
+- **v11+**: Vurdere lengre rollouts (2→4 step), evt. fjerne aux decoder.

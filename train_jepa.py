@@ -205,10 +205,14 @@ def main():
         units=mlp_units,
         discrete=True,
     ).to(device)
+    critic_num_bins = cfg.get("critic_num_bins", 0)
     critic = Critic(
         hidden_dim=embed_dim,
         stoch_dim=0,
         units=mlp_units,
+        num_bins=critic_num_bins,
+        bin_low=cfg.get("critic_bin_low", -3.0),
+        bin_high=cfg.get("critic_bin_high", 3.0),
     ).to(device)
 
     torch.backends.cudnn.benchmark = True

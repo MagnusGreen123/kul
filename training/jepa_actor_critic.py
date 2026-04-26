@@ -57,6 +57,7 @@ class JEPAActorCriticTrainer:
         self.critic = critic.to(device)
         self.world_model = world_model  # already on device, frozen during AC training
         self.device = device
+        self.categorical_critic = critic.categorical
 
         # Target critic
         self.target_critic = copy.deepcopy(critic).to(device)
@@ -76,7 +77,7 @@ class JEPAActorCriticTrainer:
         self.max_grad_norm = cfg.get("max_grad_norm", 2.0)
         self.critic_grad_clip = cfg.get("critic_grad_clip", self.max_grad_norm)
 
-        # Return normalization — EMA of 5th/95th percentiles
+        # Return normalization — EMA of 5th/95th percentiles (for actor only)
         self._return_ema_low = None
         self._return_ema_high = None
         self._return_ema_decay = 0.99
@@ -161,10 +162,10 @@ class JEPAActorCriticTrainer:
                 # stay bounded — symexp here caused a self-reinforcing
                 # value explosion (9740 when true value is ~-8).
                 reward = self.world_model.reward_pred(next_emb).clamp(-5, 5)
-                # Critic predicts in normalized space; denormalize back
-                # to symlog for lambda-return computation (DreamerV3-style).
-                raw_value = self.target_critic(next_emb)
-                value = self._denormalize_returns(raw_value).clamp(-10, 10)
+                # Target critic outputs scalar value directly:
+                # - Categorical mode: expected value over bins (already in symlog space)
+                # - Scalar mode: raw scalar output
+                value = self.target_critic(next_emb).clamp(-10, 10)
                 cont = torch.sigmoid(self.world_model.cont_pred(next_emb))
 
             emb_list.append(next_emb)
@@ -240,8 +241,8 @@ class JEPAActorCriticTrainer:
             rewards, values, self.gamma, self.lambda_, continuations=conts
         )
 
-        # ── Return normalization (DreamerV3-style) ──
-        # Update stats once, then normalize for both actor and critic.
+        # ── Return normalization for actor (percentile-based, DreamerV3-style) ──
+        # Only used for actor REINFORCE signal, NOT for critic targets.
         self._update_return_stats(lambda_returns)
         normed_returns = self._normalize_returns(lambda_returns)
 
@@ -263,12 +264,13 @@ class JEPAActorCriticTrainer:
         actor_grad = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_opt.step()
 
-        # ── Critic loss ── MSE on normalized lambda-returns
-        # Critic predicts in normalized space; targets are normalized too.
-        # This prevents critic loss explosion during reward regime shifts.
-        critic_values = self.critic(emb_imag.detach())
-        critic_target = normed_returns.detach()
-        critic_loss = F.mse_loss(critic_values, critic_target)
+        # ── Critic loss ──
+        # Categorical mode: cross-entropy against two-hot encoded lambda-returns
+        #   (bounded gradients, handles regime shifts naturally)
+        # Scalar mode: MSE on raw lambda-returns (v6-v9 fallback)
+        critic_loss = self.critic.compute_loss(
+            emb_imag.detach(), lambda_returns.detach()
+        )
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -309,7 +311,7 @@ if __name__ == "__main__":
     embed_dim = 256
     act_dim = 4
 
-    cfg = {
+    base_cfg = {
         "obs_channels": 4,
         "embed_dim": embed_dim,
         "act_dim": act_dim,
@@ -338,22 +340,35 @@ if __name__ == "__main__":
         "history_size": 3,
     }
 
-    wm = JEPAWorldModel(cfg).to(device)
-    actor = Actor(hidden_dim=embed_dim, stoch_dim=0, act_dim=act_dim,
-                  units=400, discrete=True)
-    critic = Critic(hidden_dim=embed_dim, stoch_dim=0, units=400)
-    ac_trainer = JEPAActorCriticTrainer(actor, critic, wm, cfg, device)
+    wm = JEPAWorldModel(base_cfg).to(device)
 
-    # Fake embeddings from world model
+    # Test scalar mode (backwards compatible)
+    print("--- Scalar critic ---")
+    actor_s = Actor(hidden_dim=embed_dim, stoch_dim=0, act_dim=act_dim,
+                    units=400, discrete=True)
+    critic_s = Critic(hidden_dim=embed_dim, stoch_dim=0, units=400)
+    ac_s = JEPAActorCriticTrainer(actor_s, critic_s, wm, base_cfg, device)
+
     B, T = 4, 20
     emb_seq = torch.randn(B, T, embed_dim, device=device)
+    for step in range(3):
+        losses = ac_s.train_step(emb_seq)
+        print(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in losses.items()))
+
+    # Test categorical mode (v10)
+    print("\n--- Categorical critic (128 bins) ---")
+    actor_c = Actor(hidden_dim=embed_dim, stoch_dim=0, act_dim=act_dim,
+                    units=400, discrete=True)
+    critic_c = Critic(hidden_dim=embed_dim, stoch_dim=0, units=400,
+                      num_bins=128, bin_low=-3.0, bin_high=3.0)
+    ac_c = JEPAActorCriticTrainer(actor_c, critic_c, wm, base_cfg, device)
 
     for step in range(3):
-        losses = ac_trainer.train_step(emb_seq)
+        losses = ac_c.train_step(emb_seq)
         print(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in losses.items()))
 
     # Verify target critic diverges
-    for p, tp in zip(ac_trainer.critic.parameters(), ac_trainer.target_critic.parameters()):
+    for p, tp in zip(ac_c.critic.parameters(), ac_c.target_critic.parameters()):
         assert not torch.equal(p.data, tp.data), "Target should lag behind live critic"
 
-    print("Smoke test passed!")
+    print("\nBoth modes passed!")

@@ -74,7 +74,7 @@ eval_every: 20000
 # Buffer — shorter to keep data fresh (v6 resume effect)
 # v10 had 2M. v6's resume started with empty buffer = only recent data.
 # 500k keeps ~250 episodes — plenty of diversity, but discards stale early data.
-buffer_max_steps: 500000
+buffer_max_steps: 200000
 
 # Wandb
 wandb_project: "dreamer"

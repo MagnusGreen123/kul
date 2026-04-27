@@ -1,0 +1,82 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3          # context window for imagination rollouts (like LeWM)
+
+# SIGReg — isotropic Gaussian regularizer (replaces KL + stop-gradient)
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+reward_weight: 10.0
+use_symlog: true
+
+# Auxiliary decoder — forces encoder to capture foreground (ball/paddle)
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# Actor-critic — v6 fast MSE critic + metric gate + effective grad clip
+# Rationale: v6 reached +11 with fast MSE but collapsed. v10 categorical was
+# stable but plateaued at -2. v11 uses v6's fast critic with a grad clip that
+# actually activates (v6 grads were 0.3-0.65 normal, 2.0+ during collapse).
+ac_warmup_steps: 20000
+ac_gate_threshold: 0.015  # don't start AC until wm/pred EMA < this
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98    # v6: fast target updates
+critic_grad_clip: 1.5     # v6 was 10 (never activated). 1.5 catches collapse but allows normal learning
+critic_lr: 1.0e-4         # v6: full learning rate
+
+# No categorical critic — back to scalar MSE (v6-style)
+# critic_num_bins: 0 is the default when omitted
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+eval_every: 20000
+
+# Buffer — shorter to keep data fresh (v6 resume effect)
+# v10 had 2M. v6's resume started with empty buffer = only recent data.
+# 500k keeps ~250 episodes — plenty of diversity, but discards stale early data.
+buffer_max_steps: 500000
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v11"

@@ -19,7 +19,7 @@ sys.path.insert(0, ".")
 
 from models.actor import Actor
 from models.critic import Critic
-from training.jepa_world_model import JEPAWorldModel
+from training.jepa_world_model import JEPAWorldModel, symlog
 
 
 def compute_lambda_returns(rewards, values, gamma: float = 0.997,
@@ -77,6 +77,10 @@ class JEPAActorCriticTrainer:
         self.max_grad_norm = cfg.get("max_grad_norm", 2.0)
         self.critic_grad_clip = cfg.get("critic_grad_clip", self.max_grad_norm)
 
+        # Real TD target weight (reality anchor for critic)
+        self.real_td_weight = cfg.get("real_td_weight", 0.0)
+        self.use_symlog = cfg.get("use_symlog", True)
+
         # Return normalization — EMA of 5th/95th percentiles (for actor only)
         self._return_ema_low = None
         self._return_ema_high = None
@@ -114,6 +118,35 @@ class JEPAActorCriticTrainer:
         """Convert critic output (normalized space) back to symlog space."""
         scale, offset = self._return_scale_offset()
         return normalized * scale + offset
+
+    def _compute_real_td_loss(self, emb_seq, rewards, dones):
+        """Compute critic loss on real 1-step TD targets (reality anchor).
+
+        Args:
+            emb_seq: (B, T, D) real embeddings from encoder
+            rewards: (B, T) real rewards (reward[t] = reward after action at t)
+            dones:   (B, T) done flags or None
+
+        Returns:
+            scalar loss
+        """
+        B, T, D = emb_seq.shape
+        emb_t = emb_seq[:, :-1].detach()      # (B, T-1, D)
+        emb_next = emb_seq[:, 1:].detach()     # (B, T-1, D)
+        rew = rewards[:, :-1]                   # (B, T-1)
+
+        if dones is not None:
+            cont = 1.0 - dones[:, :-1]          # (B, T-1)
+        else:
+            cont = 1.0
+
+        with torch.no_grad():
+            rew_symlog = symlog(rew) if self.use_symlog else rew
+            next_value = self.target_critic(emb_next)  # (B, T-1)
+            td_target = rew_symlog + self.gamma * cont * next_value
+            td_target = td_target.clamp(-10, 10)
+
+        return self.critic.compute_loss(emb_t, td_target)
 
     def imagine_rollout(self, initial_emb):
         """Roll out in imagination using actor + predictor.
@@ -194,12 +227,13 @@ class JEPAActorCriticTrainer:
             torch.stack(cont_list, dim=1),       # (B, H)
         )
 
-    def train_step(self, emb_seq, dones=None):
+    def train_step(self, emb_seq, dones=None, real_rewards=None):
         """Train actor and critic from world model embeddings.
 
         Args:
-            emb_seq: (B, T, D) embeddings from JEPA world model
-            dones:   (B, T) done flags (optional)
+            emb_seq:      (B, T, D) embeddings from JEPA world model
+            dones:        (B, T) done flags (optional)
+            real_rewards: (B, T) real rewards for TD anchor (optional)
 
         Returns:
             dict of losses
@@ -268,9 +302,18 @@ class JEPAActorCriticTrainer:
         # Categorical mode: cross-entropy against two-hot encoded lambda-returns
         #   (bounded gradients, handles regime shifts naturally)
         # Scalar mode: MSE on raw lambda-returns (v6-v9 fallback)
-        critic_loss = self.critic.compute_loss(
+        imag_critic_loss = self.critic.compute_loss(
             emb_imag.detach(), lambda_returns.detach()
         )
+
+        # ── Real TD anchor (v12+) ── breaks self-reinforcing feedback loop
+        real_td_loss_val = 0.0
+        if self.real_td_weight > 0 and real_rewards is not None:
+            real_td_loss = self._compute_real_td_loss(emb_seq, real_rewards, dones)
+            critic_loss = (1 - self.real_td_weight) * imag_critic_loss + self.real_td_weight * real_td_loss
+            real_td_loss_val = real_td_loss.item()
+        else:
+            critic_loss = imag_critic_loss
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -301,6 +344,7 @@ class JEPAActorCriticTrainer:
             "imag_emb_norm_start": imag_norm_start,
             "imag_emb_norm_end": imag_norm_end,
             "return_scale": return_scale,
+            "real_td_loss": real_td_loss_val,
         }
 
 

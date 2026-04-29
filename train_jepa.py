@@ -385,7 +385,8 @@ def main():
                         print(f"AC training started at step {global_step}")
                         _ac_warmup_logged = True
                     ac_losses = ac_trainer.train_step(
-                        wm_info["emb_seq"], dones=wm_info.get("dones")
+                        wm_info["emb_seq"], dones=wm_info.get("dones"),
+                        real_rewards=batch["reward"].to(device),
                     )
                 else:
                     ac_losses = {}

@@ -253,6 +253,10 @@ def main():
                     wm_trainer.scheduler.load_state_dict(ckpt["wm_scheduler"])
                 ac_trainer.actor_opt.load_state_dict(ckpt["actor_optimizer"])
                 ac_trainer.critic_opt.load_state_dict(ckpt["critic_optimizer"])
+                if "critic_scheduler" in ckpt:
+                    ac_trainer.critic_scheduler.load_state_dict(ckpt["critic_scheduler"])
+                if "ac_step_count" in ckpt:
+                    ac_trainer._ac_step_count = ckpt["ac_step_count"]
                 global_step = ckpt["global_step"]
                 episode_count = ckpt.get("episode_count", 0)
                 print(f"Resumed at step {global_step}, episode {episode_count}")
@@ -336,6 +340,8 @@ def main():
             "wm_scheduler": wm_trainer.scheduler.state_dict(),
             "actor_optimizer": ac_trainer.actor_opt.state_dict(),
             "critic_optimizer": ac_trainer.critic_opt.state_dict(),
+            "critic_scheduler": ac_trainer.critic_scheduler.state_dict(),
+            "ac_step_count": ac_trainer._ac_step_count,
         }, path)
         print(f"Saved checkpoint: {path}")
 

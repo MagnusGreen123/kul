@@ -9,6 +9,7 @@ Key differences from RSSM-based actor_critic.py:
 """
 
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -76,6 +77,27 @@ class JEPAActorCriticTrainer:
         self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=critic_lr, eps=1e-5, weight_decay=5e-4)
         self.max_grad_norm = cfg.get("max_grad_norm", 2.0)
         self.critic_grad_clip = cfg.get("critic_grad_clip", self.max_grad_norm)
+
+        # Critic LR cosine decay (v13): v11 data showed monotonic critic drift
+        # over training with constant LR. Decay LR over AC train calls so the
+        # critic stops drifting once policy is good. Counts only train_step
+        # calls (not env steps), so decay starts when AC actually trains.
+        critic_lr_min = cfg.get("critic_lr_min", critic_lr * 0.1)
+        critic_lr_decay_steps = cfg.get("critic_lr_decay_steps", 100000)
+        self._critic_lr_min_ratio = critic_lr_min / critic_lr if critic_lr > 0 else 1.0
+        self._critic_lr_decay_steps = critic_lr_decay_steps
+        self._ac_step_count = 0
+
+        def critic_lr_lambda(step):
+            if step >= critic_lr_decay_steps:
+                return self._critic_lr_min_ratio
+            progress = step / max(1, critic_lr_decay_steps)
+            cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return self._critic_lr_min_ratio + cos_factor * (1.0 - self._critic_lr_min_ratio)
+
+        self.critic_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.critic_opt, critic_lr_lambda
+        )
 
         # Real TD target weight (reality anchor for critic)
         self.real_td_weight = cfg.get("real_td_weight", 0.0)
@@ -319,6 +341,8 @@ class JEPAActorCriticTrainer:
         critic_loss.backward()
         critic_grad = nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
         self.critic_opt.step()
+        self.critic_scheduler.step()
+        self._ac_step_count += 1
 
         # ── EMA update target critic ──
         self._update_target_critic()
@@ -345,6 +369,7 @@ class JEPAActorCriticTrainer:
             "imag_emb_norm_end": imag_norm_end,
             "return_scale": return_scale,
             "real_td_loss": real_td_loss_val,
+            "critic_lr": self.critic_opt.param_groups[0]["lr"],
         }
 
 

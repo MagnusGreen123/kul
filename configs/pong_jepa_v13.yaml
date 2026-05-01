@@ -1,0 +1,84 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+# SIGReg — isotropic Gaussian regularizer (replaces KL + stop-gradient)
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+reward_weight: 10.0
+use_symlog: true
+
+# Auxiliary decoder — forces encoder to capture foreground (ball/paddle)
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# Actor-critic — v13: v12 base + critic LR cosine decay
+# Diagnosis from v6/v11 wandb data: critic drifted monotonically with constant
+# LR=1e-4 (imag_v fell from -1.29 to -4.37 in last 130k steps of v11, while
+# critic_loss climbed 0.09→0.18 and critic_grad_norm 0.78→1.16). Reward
+# oscillated; +11 peak was a variance spike, not a stable regime.
+# Fix: cosine decay critic_lr from 1e-4 → 1e-5 over 100k AC train steps so
+# critic stops drifting once policy is good. Real-TD anchor (v12) is kept
+# since v12-fresh data showed it smoothed the imag_v trajectory.
+ac_warmup_steps: 20000
+ac_gate_threshold: 0.015
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+critic_lr_min: 1.0e-5            # NEW v13: floor for cosine decay (10% of start)
+critic_lr_decay_steps: 100000    # NEW v13: AC train calls until LR reaches min
+real_td_weight: 0.3              # kept from v12 — was stabilizing (not skadelig)
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+eval_every: 20000
+
+# Buffer — same short buffer as v11/v12
+buffer_max_steps: 200000
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v13"

@@ -392,6 +392,17 @@ def main():
             window_min = float(np.min(reward_window))
             above_zero = sum(1 for r in reward_window if r > 0)
             above_5 = sum(1 for r in reward_window if r > 5)
+            # Save best.pt only when window is full (avoids spam during early fill)
+            # and improvement is meaningful (> 0.25 above previous best)
+            new_best_flag = 0
+            if (len(reward_window) >= best_window_min_eps
+                    and window_avg > best_window_avg + 0.25):
+                best_window_avg = window_avg
+                save_checkpoint(fixed_name="best.pt")
+                new_best_flag = 1
+                print(f"NEW BEST: window_avg={window_avg:.2f} at step {global_step} "
+                      f"(max={window_max:.0f}, above0={above_zero}/{len(reward_window)})")
+
             window_metrics = {
                 "episode/window_avg": window_avg,
                 "episode/window_max": window_max,
@@ -399,17 +410,12 @@ def main():
                 "episode/above_zero_count": above_zero,
                 "episode/above_5_count": above_5,
                 "episode/window_size": len(reward_window),
+                "episode/best_window_avg": (
+                    best_window_avg if best_window_avg != float("-inf") else 0.0
+                ),
+                "episode/new_best_event": new_best_flag,
             }
             logger.log_step(window_metrics, step=global_step)
-
-            # Save best.pt only when window is full (avoids spam during early fill)
-            # and improvement is meaningful (> 0.25 above previous best)
-            if (len(reward_window) >= best_window_min_eps
-                    and window_avg > best_window_avg + 0.25):
-                best_window_avg = window_avg
-                save_checkpoint(fixed_name="best.pt")
-                print(f"NEW BEST: window_avg={window_avg:.2f} at step {global_step} "
-                      f"(max={window_max:.0f}, above0={above_zero}/{len(reward_window)})")
 
         # ── Train phase ──
         n_train = max(1, int(steps * train_ratio))

@@ -6,6 +6,7 @@ Usage: python train_jepa.py --config configs/pong_jepa.yaml
 import argparse
 import concurrent.futures
 import traceback
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -238,6 +239,8 @@ def main():
     # ── Resume ──
     global_step = 0
     episode_count = 0
+    _resumed_best = float("-inf")
+    _resumed_window = []
     if args.resume:
         ckpt_path = find_latest_checkpoint(ckpt_dir)
         if ckpt_path is not None:
@@ -257,6 +260,8 @@ def main():
                     ac_trainer.critic_scheduler.load_state_dict(ckpt["critic_scheduler"])
                 if "ac_step_count" in ckpt:
                     ac_trainer._ac_step_count = ckpt["ac_step_count"]
+                _resumed_best = ckpt.get("best_window_avg", float("-inf"))
+                _resumed_window = ckpt.get("reward_window", [])
                 global_step = ckpt["global_step"]
                 episode_count = ckpt.get("episode_count", 0)
                 print(f"Resumed at step {global_step}, episode {episode_count}")
@@ -326,9 +331,23 @@ def main():
     total_steps = cfg["total_steps"]
     train_ratio = cfg.get("train_ratio", 1.0)
 
-    def save_checkpoint(tag=None):
-        name = f"step_{global_step}.pt" if tag is None else f"step_{global_step}_{tag}.pt"
-        path = ckpt_dir / name
+    # ── Reward window tracking (catch breakthroughs) ──
+    reward_window_size = cfg.get("reward_window_size", 50)
+    reward_window = deque(maxlen=reward_window_size)
+    best_window_avg = float("-inf")
+    best_window_min_eps = cfg.get("best_window_min_eps", 30)
+    if args.resume and _resumed_best != float("-inf"):
+        best_window_avg = _resumed_best
+        for r in _resumed_window[-reward_window_size:]:
+            reward_window.append(r)
+        print(f"Restored: best_window_avg={best_window_avg:.2f}, window_size={len(reward_window)}")
+
+    def save_checkpoint(tag=None, fixed_name=None):
+        if fixed_name is not None:
+            path = ckpt_dir / fixed_name
+        else:
+            name = f"step_{global_step}.pt" if tag is None else f"step_{global_step}_{tag}.pt"
+            path = ckpt_dir / name
         torch.save({
             "global_step": global_step,
             "episode_count": episode_count,
@@ -342,6 +361,8 @@ def main():
             "critic_optimizer": ac_trainer.critic_opt.state_dict(),
             "critic_scheduler": ac_trainer.critic_scheduler.state_dict(),
             "ac_step_count": ac_trainer._ac_step_count,
+            "best_window_avg": best_window_avg,
+            "reward_window": list(reward_window),
         }, path)
         print(f"Saved checkpoint: {path}")
 
@@ -357,9 +378,38 @@ def main():
         ep_rewards = []
         for obs, actions, rewards, dones in episodes:
             buffer.add_episode(obs, actions, rewards, dones)
-            ep_rewards.append(rewards.sum())
+            ep_rewards.append(float(rewards.sum()))
             episode_count += 1
             logger.log_episode(rewards.sum(), len(rewards), step=global_step)
+
+        # Update reward window and check for new best
+        for r in ep_rewards:
+            reward_window.append(r)
+
+        if len(reward_window) >= 10:
+            window_avg = float(np.mean(reward_window))
+            window_max = float(np.max(reward_window))
+            window_min = float(np.min(reward_window))
+            above_zero = sum(1 for r in reward_window if r > 0)
+            above_5 = sum(1 for r in reward_window if r > 5)
+            window_metrics = {
+                "episode/window_avg": window_avg,
+                "episode/window_max": window_max,
+                "episode/window_min": window_min,
+                "episode/above_zero_count": above_zero,
+                "episode/above_5_count": above_5,
+                "episode/window_size": len(reward_window),
+            }
+            logger.log_step(window_metrics, step=global_step)
+
+            # Save best.pt only when window is full (avoids spam during early fill)
+            # and improvement is meaningful (> 0.25 above previous best)
+            if (len(reward_window) >= best_window_min_eps
+                    and window_avg > best_window_avg + 0.25):
+                best_window_avg = window_avg
+                save_checkpoint(fixed_name="best.pt")
+                print(f"NEW BEST: window_avg={window_avg:.2f} at step {global_step} "
+                      f"(max={window_max:.0f}, above0={above_zero}/{len(reward_window)})")
 
         # ── Train phase ──
         n_train = max(1, int(steps * train_ratio))
@@ -419,13 +469,17 @@ def main():
         # ── Log ──
         if ep_rewards:
             avg_reward = np.mean(ep_rewards)
-            logger.print_status(global_step, {
+            status = {
                 "avg_reward": avg_reward,
                 "episodes": episode_count,
                 "n_eps": len(episodes),
                 "buffer": buffer.total_steps,
                 "train_steps": n_train,
-            })
+            }
+            if len(reward_window) >= 10:
+                status["w_avg"] = float(np.mean(reward_window))
+                status["w_best"] = best_window_avg if best_window_avg != float("-inf") else 0.0
+            logger.print_status(global_step, status)
 
         # ── Checkpoint ──
         if global_step % cfg.get("checkpoint_every", 10000) < collect_per_step + 1000:

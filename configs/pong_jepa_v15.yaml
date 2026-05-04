@@ -1,0 +1,91 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+# SIGReg
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+reward_weight: 10.0
+use_symlog: true
+
+# Auxiliary decoder
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# Actor-critic — v15: v11 EXACT (revert horizon back to 15) + 5-step
+# autoregressive rollout training. The single algorithmic change vs v11
+# is rollout_steps 2 -> 5. Goal: fix the train/inference mismatch
+# identified by probe data (cosine 0.999 -> 0.80 over 15 imagined steps,
+# while training only sees 2-step compositions). Predictor should learn
+# to compose its own predictions over longer chains.
+ac_warmup_steps: 20000
+ac_gate_threshold: 0.015
+act_dim: 6
+mlp_units: 400
+horizon: 15                  # back to v11 baseline (v14's horizon=8 hurt)
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# K-step autoregressive rollout training (NEW v15)
+# Predictor is rolled out 5 steps autoregressively at every valid start
+# position in the batch window (S = batch_length - history_size - K + 1
+# = 30 - 3 - 5 + 1 = 23 starts per sample, gradient through full chain).
+rollout_steps: 5
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule — START WITH 200k ABLATION
+# Decision point: at step 200000, compare 50-ep window_avg vs v11 trajectory.
+# v11 reached -14 to -15 at 200k. If v15 is meaningfully better, extend to 500k.
+prefill_steps: 10000
+total_steps: 200000
+checkpoint_every: 50000
+log_every: 4000
+eval_every: 20000
+
+# Buffer
+buffer_max_steps: 200000
+
+# Breakthrough tracking (kept from v14)
+reward_window_size: 50
+best_window_min_eps: 30
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v15-rollout5"

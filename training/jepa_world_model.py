@@ -94,6 +94,8 @@ class JEPAWorldModel(nn.Module):
         self.use_symlog = cfg.get("use_symlog", True)
 
         self.embed_dim = embed_dim
+        self.history_size = cfg.get("history_size", 3)
+        self.rollout_steps = cfg.get("rollout_steps", 2)
 
     def encode(self, obs):
         """Encode observations to JEPA embeddings.
@@ -151,16 +153,49 @@ class JEPAWorldModel(nn.Module):
         # NO detach on target — end-to-end gradient through encoder
         pred_loss = F.mse_loss(pred, pred_target)
 
-        # ── Multi-step rollout loss (2-step) ──
-        # Feed teacher-forcing predictions back into predictor.
-        # pred[:, i] = ê_{i+1}, paired with actions[:, i+1] = a_{i+1}
-        if T > 2 and self.rollout_weight > 0:
-            rollout_pred = self.predictor(
-                pred[:, :-1].detach() if False else pred[:, :-1],  # keep grad flowing
-                actions[:, 1:-1],
-            )  # (B, T-2, D)
-            rollout_target = embeddings[:, 2:]  # (B, T-2, D)
-            rollout_loss = F.mse_loss(rollout_pred, rollout_target)
+        # ── K-step autoregressive rollout loss ──
+        # Truly autoregressive: each step's prediction is fed back as the
+        # next step's context. Multi-start: roll out from every valid
+        # start position in the window for max signal density.
+        # Trains the predictor on the same kind of compositional chains
+        # that imagination uses at AC time, fixing the train/inference gap.
+        HS = self.history_size
+        K = self.rollout_steps
+        if T >= HS + K and self.rollout_weight > 0 and K > 0:
+            S = T - HS - K + 1                                    # valid starts
+            start_idx = torch.arange(S, device=obs.device)        # (S,)
+            hist_off = torch.arange(HS, device=obs.device)        # (HS,)
+            hist_idx = start_idx.unsqueeze(1) + hist_off.unsqueeze(0)  # (S, HS)
+
+            init_emb = embeddings[:, hist_idx]                    # (B, S, HS, D)
+            init_act = actions[:, hist_idx]                       # (B, S, HS, A)
+
+            BS = B * S
+            init_emb_flat = init_emb.reshape(BS, HS, self.embed_dim)
+            init_act_flat = init_act.reshape(BS, HS, actions.shape[-1])
+
+            emb_buffer = [init_emb_flat[:, t] for t in range(HS)]  # list of (BS, D)
+            act_buffer = [init_act_flat[:, t] for t in range(HS)]
+
+            rollout_terms = []
+            for k in range(K):
+                ctx_e = torch.stack(emb_buffer[-HS:], dim=1)       # (BS, HS, D)
+                ctx_a = torch.stack(act_buffer[-HS:], dim=1)       # (BS, HS, A)
+                pred_seq = self.predictor(ctx_e, ctx_a)
+                next_pred = pred_seq[:, -1].clamp(-10, 10)         # (BS, D)
+
+                # Target embedding at horizon HS+k for each start
+                tgt_idx = start_idx + (HS + k)                     # (S,)
+                target = embeddings[:, tgt_idx]                    # (B, S, D)
+                target_flat = target.reshape(BS, self.embed_dim)
+                rollout_terms.append(F.mse_loss(next_pred, target_flat))
+
+                emb_buffer.append(next_pred)
+                # Real action taken at the just-predicted state, for next step
+                next_act = actions[:, tgt_idx]                     # (B, S, A)
+                act_buffer.append(next_act.reshape(BS, actions.shape[-1]))
+
+            rollout_loss = sum(rollout_terms) / K
         else:
             rollout_loss = torch.zeros(1, device=obs.device)
 
@@ -238,6 +273,46 @@ class JEPAWorldModel(nn.Module):
                     reward_pred.abs() < 0.1
                 ).float().mean().item(),
             }
+
+            # ── Long-horizon rollout diagnostic ──
+            # Mimics imagination procedure: autoregressive predictor with
+            # truncated history window (history_size). Logs cosine similarity
+            # between predicted and real embeddings at 5/10/15 step horizons.
+            # Critical to detect compounding rollout error during training,
+            # which the 1-step pred_cosine masks completely.
+            HS = self.history_size
+            ROLLOUT_STEPS = [5, 10, 15]
+            max_horizon = max(ROLLOUT_STEPS)
+            # Need at least HS history + max_horizon real future = HS + max_horizon
+            if T >= HS + max_horizon:
+                emb_list = [embeddings[:, t] for t in range(HS)]  # initial history
+                act_list = [actions[:, t] for t in range(HS)]      # paired actions
+                rollout_cos = {}
+                for step_i in range(max_horizon):
+                    ctx_e = torch.stack(emb_list[-HS:], dim=1)   # (B, HS, D)
+                    ctx_a = torch.stack(act_list[-HS:], dim=1)   # (B, HS, act_dim)
+                    pred_seq = self.predictor(ctx_e, ctx_a)
+                    next_pred = pred_seq[:, -1].clamp(-10, 10)   # (B, D)
+                    emb_list.append(next_pred)
+                    # Use real next action to feed the next rollout step
+                    real_next_t = HS + step_i
+                    if real_next_t < T:
+                        act_list.append(actions[:, real_next_t])
+
+                    # Compare to real embedding at this horizon
+                    horizon = step_i + 1  # 1-indexed
+                    if horizon in ROLLOUT_STEPS:
+                        real_t = HS + step_i  # absolute index of e_{HS+step_i+1-1+1}
+                        # next_pred is prediction for embedding at index HS+step_i
+                        # (predictor predicts e_{i+1} from context ending at e_i;
+                        # last context emb is at index HS+step_i-1, so prediction is for HS+step_i)
+                        if real_t < T:
+                            real_emb = embeddings[:, real_t]
+                            cos = F.cosine_similarity(
+                                next_pred, real_emb, dim=-1
+                            ).mean().item()
+                            rollout_cos[f"rollout_cosine_{horizon}step"] = cos
+                diag.update(rollout_cos)
 
         info = {
             "emb_seq": embeddings.detach(),

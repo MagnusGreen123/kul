@@ -153,47 +153,31 @@ class JEPAWorldModel(nn.Module):
         # NO detach on target — end-to-end gradient through encoder
         pred_loss = F.mse_loss(pred, pred_target)
 
-        # ── K-step autoregressive rollout loss ──
-        # Truly autoregressive: each step's prediction is fed back as the
-        # next step's context. Multi-start: roll out from every valid
-        # start position in the window for max signal density.
-        # Trains the predictor on the same kind of compositional chains
-        # that imagination uses at AC time, fixing the train/inference gap.
+        # ── K-step autoregressive rollout loss (single-start) ──
+        # Roll out K steps autoregressively from t=0, feeding each
+        # prediction back as next-step context. Compositional training
+        # signal that fixes the train/inference mismatch.
+        # Single-start (not multi-start) for memory: V100 32GB OOMs at
+        # B*S=11776 effective batch in predictor calls. Predictor still
+        # gets full multi-position 1-step training via pred_loss above.
         HS = self.history_size
         K = self.rollout_steps
         if T >= HS + K and self.rollout_weight > 0 and K > 0:
-            S = T - HS - K + 1                                    # valid starts
-            start_idx = torch.arange(S, device=obs.device)        # (S,)
-            hist_off = torch.arange(HS, device=obs.device)        # (HS,)
-            hist_idx = start_idx.unsqueeze(1) + hist_off.unsqueeze(0)  # (S, HS)
-
-            init_emb = embeddings[:, hist_idx]                    # (B, S, HS, D)
-            init_act = actions[:, hist_idx]                       # (B, S, HS, A)
-
-            BS = B * S
-            init_emb_flat = init_emb.reshape(BS, HS, self.embed_dim)
-            init_act_flat = init_act.reshape(BS, HS, actions.shape[-1])
-
-            emb_buffer = [init_emb_flat[:, t] for t in range(HS)]  # list of (BS, D)
-            act_buffer = [init_act_flat[:, t] for t in range(HS)]
+            emb_buffer = [embeddings[:, t] for t in range(HS)]    # (B, D) each
+            act_buffer = [actions[:, t] for t in range(HS)]
 
             rollout_terms = []
             for k in range(K):
-                ctx_e = torch.stack(emb_buffer[-HS:], dim=1)       # (BS, HS, D)
-                ctx_a = torch.stack(act_buffer[-HS:], dim=1)       # (BS, HS, A)
+                ctx_e = torch.stack(emb_buffer[-HS:], dim=1)      # (B, HS, D)
+                ctx_a = torch.stack(act_buffer[-HS:], dim=1)      # (B, HS, A)
                 pred_seq = self.predictor(ctx_e, ctx_a)
-                next_pred = pred_seq[:, -1].clamp(-10, 10)         # (BS, D)
+                next_pred = pred_seq[:, -1].clamp(-10, 10)        # (B, D)
 
-                # Target embedding at horizon HS+k for each start
-                tgt_idx = start_idx + (HS + k)                     # (S,)
-                target = embeddings[:, tgt_idx]                    # (B, S, D)
-                target_flat = target.reshape(BS, self.embed_dim)
-                rollout_terms.append(F.mse_loss(next_pred, target_flat))
+                target = embeddings[:, HS + k]                    # (B, D)
+                rollout_terms.append(F.mse_loss(next_pred, target))
 
                 emb_buffer.append(next_pred)
-                # Real action taken at the just-predicted state, for next step
-                next_act = actions[:, tgt_idx]                     # (B, S, A)
-                act_buffer.append(next_act.reshape(BS, actions.shape[-1]))
+                act_buffer.append(actions[:, HS + k])
 
             rollout_loss = sum(rollout_terms) / K
         else:

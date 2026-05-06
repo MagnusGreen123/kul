@@ -1,0 +1,87 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+# SIGReg
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+reward_weight: 10.0
+use_symlog: true
+
+# Auxiliary decoder
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# Actor-critic — RESUMED from v15 step_200400.pt.
+# Single change vs v15: ac_gate_threshold raised 0.015 -> 0.022 so AC can
+# actually start training. v15's final wm/pred = 0.0195 (K-step rollout
+# degraded 1-step pred quality vs v11's 0.0138 at same step), but
+# rollout_cosine_15step hit 0.92 (vs v5 baseline 0.80). This run tests
+# whether the better long-horizon consistency translates to better policy
+# despite the worse 1-step pred. Total horizon = 500k env steps.
+ac_warmup_steps: 20000
+ac_gate_threshold: 0.022
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# K-step autoregressive rollout training (kept from v15)
+rollout_steps: 5
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+eval_every: 20000
+
+# Buffer
+buffer_max_steps: 200000
+
+# Breakthrough tracking
+reward_window_size: 50
+best_window_min_eps: 30
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v15-resumed"

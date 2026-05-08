@@ -48,7 +48,9 @@ class JEPAWorldModel(nn.Module):
         )
         self.encoder_bn = nn.BatchNorm1d(embed_dim)
 
-        # Predictor: transformer with AdaLN action conditioning
+        # Predictor: transformer with AdaLN action conditioning.
+        # Optional stochastic mode (v17): adds Gaussian (mean, log_var) head
+        # so prediction loss switches to NLL and imagination samples noise.
         self.predictor = ActionConditionedPredictor(
             embed_dim=embed_dim,
             act_dim=act_dim,
@@ -57,7 +59,15 @@ class JEPAWorldModel(nn.Module):
             mlp_dim=cfg.get("pred_mlp_dim", 512),
             max_seq_len=cfg.get("batch_length", 30) + 2,
             dropout=cfg.get("pred_dropout", 0.1),
+            stochastic=cfg.get("stochastic_predictor", False),
+            logvar_init=cfg.get("logvar_init", -2.0),
+            logvar_min=cfg.get("logvar_min", -5.0),
+            logvar_max=cfg.get("logvar_max", 2.0),
         )
+        self.stochastic_predictor = cfg.get("stochastic_predictor", False)
+        # When true, the rollout chain feeds samples (with reparameterized
+        # noise) back into itself. When false, it feeds the mean.
+        self.rollout_sample = cfg.get("rollout_sample", False)
 
         # SIGReg regularizer
         self.sigreg = SIGReg(
@@ -148,40 +158,79 @@ class JEPAWorldModel(nn.Module):
         # ── Teacher-forcing prediction ──
         # (e_t, a_t) -> predict e_{t+1}
         # No action shifting: a_t is the action taken AT state t.
-        pred = self.predictor(embeddings[:, :-1], actions[:, :-1])  # (B, T-1, D)
+        # Stochastic mode (v17): predictor returns (mean, log_var). Training
+        # loss is Gaussian NLL; wm/pred logging stays as MSE for fair
+        # comparison with deterministic baselines (v11, v15).
         pred_target = embeddings[:, 1:]  # (B, T-1, D)
-        # NO detach on target — end-to-end gradient through encoder
-        pred_loss = F.mse_loss(pred, pred_target)
+        if self.stochastic_predictor:
+            pred_mean, pred_logvar = self.predictor(
+                embeddings[:, :-1], actions[:, :-1], return_dist=True
+            )
+            pred_mse = F.mse_loss(pred_mean, pred_target)
+            # NLL: 0.5 * ((mean - target)^2 / sigma^2 + log sigma^2)
+            pred_nll = 0.5 * (
+                (pred_mean - pred_target) ** 2 * (-pred_logvar).exp() + pred_logvar
+            ).mean()
+            pred_loss = pred_nll
+            pred_logvar_mean = pred_logvar.mean().detach()
+        else:
+            pred = self.predictor(embeddings[:, :-1], actions[:, :-1])
+            pred_mse = F.mse_loss(pred, pred_target)
+            pred_loss = pred_mse
+            pred_mean = pred  # for diagnostic cosine
+            pred_logvar_mean = None
 
         # ── K-step autoregressive rollout loss (single-start) ──
         # Roll out K steps autoregressively from t=0, feeding each
-        # prediction back as next-step context. Compositional training
-        # signal that fixes the train/inference mismatch.
-        # Single-start (not multi-start) for memory: V100 32GB OOMs at
-        # B*S=11776 effective batch in predictor calls. Predictor still
-        # gets full multi-position 1-step training via pred_loss above.
+        # prediction back as next-step context. In stochastic mode the
+        # chain optionally feeds reparameterized samples (rollout_sample),
+        # otherwise feeds the mean. Step loss is NLL when stochastic, MSE
+        # otherwise. Logged rollout_loss stays as MSE-equivalent for
+        # cross-version comparability.
         HS = self.history_size
         K = self.rollout_steps
         if T >= HS + K and self.rollout_weight > 0 and K > 0:
-            emb_buffer = [embeddings[:, t] for t in range(HS)]    # (B, D) each
+            emb_buffer = [embeddings[:, t] for t in range(HS)]
             act_buffer = [actions[:, t] for t in range(HS)]
 
-            rollout_terms = []
+            rollout_terms_train = []
+            rollout_terms_mse = []
             for k in range(K):
-                ctx_e = torch.stack(emb_buffer[-HS:], dim=1)      # (B, HS, D)
-                ctx_a = torch.stack(act_buffer[-HS:], dim=1)      # (B, HS, A)
-                pred_seq = self.predictor(ctx_e, ctx_a)
-                next_pred = pred_seq[:, -1].clamp(-10, 10)        # (B, D)
+                ctx_e = torch.stack(emb_buffer[-HS:], dim=1)
+                ctx_a = torch.stack(act_buffer[-HS:], dim=1)
+                target = embeddings[:, HS + k]
 
-                target = embeddings[:, HS + k]                    # (B, D)
-                rollout_terms.append(F.mse_loss(next_pred, target))
+                if self.stochastic_predictor:
+                    m_seq, lv_seq = self.predictor(ctx_e, ctx_a, return_dist=True)
+                    next_mean = m_seq[:, -1].clamp(-10, 10)
+                    next_logvar = lv_seq[:, -1]
+                    nll = 0.5 * (
+                        (next_mean - target) ** 2 * (-next_logvar).exp() + next_logvar
+                    ).mean()
+                    rollout_terms_train.append(nll)
+                    rollout_terms_mse.append(
+                        F.mse_loss(next_mean, target).detach()
+                    )
+                    if self.rollout_sample:
+                        std = (0.5 * next_logvar).exp()
+                        next_pred = (next_mean + std * torch.randn_like(next_mean)).clamp(-10, 10)
+                    else:
+                        next_pred = next_mean
+                else:
+                    pred_seq = self.predictor(ctx_e, ctx_a)
+                    next_pred = pred_seq[:, -1].clamp(-10, 10)
+                    step_mse = F.mse_loss(next_pred, target)
+                    rollout_terms_train.append(step_mse)
+                    rollout_terms_mse.append(step_mse.detach())
 
                 emb_buffer.append(next_pred)
                 act_buffer.append(actions[:, HS + k])
 
-            rollout_loss = sum(rollout_terms) / K
+            rollout_loss = sum(rollout_terms_train) / K
+            rollout_loss_mse = sum(rollout_terms_mse) / K
         else:
             rollout_loss = torch.zeros(1, device=obs.device)
+            rollout_loss_mse = torch.zeros(1, device=obs.device)
 
         # ── Reward prediction ──
         # Arrival reward convention: reward at state t is rewards[t-1].
@@ -236,27 +285,36 @@ class JEPAWorldModel(nn.Module):
             + self.aux_recon_weight * aux_recon_loss
         )
 
+        # Logged "pred" / "rollout" stay MSE so wm/pred is comparable across
+        # deterministic and stochastic versions (gate threshold, plots, etc.).
+        # Training uses pred_loss / rollout_loss which equal NLL in stochastic
+        # mode and MSE otherwise.
         losses = {
             "total": total_loss,
-            "pred": pred_loss,
-            "rollout": rollout_loss,
+            "pred": pred_mse if self.stochastic_predictor else pred_loss,
+            "rollout": rollout_loss_mse if self.stochastic_predictor else rollout_loss,
             "sigreg": sigreg_loss,
             "reward": reward_loss,
             "cont": cont_loss,
             "aux_recon": aux_recon_loss,
         }
+        if self.stochastic_predictor:
+            losses["pred_nll"] = pred_loss.detach()
+            losses["rollout_nll"] = rollout_loss.detach() if torch.is_tensor(rollout_loss) else rollout_loss
         # ── Inline diagnostics (cheap stats on existing tensors) ──
         with torch.no_grad():
             diag = {
                 "emb_mean": embeddings.mean().item(),
                 "emb_std": embeddings.std().item(),
                 "pred_cosine": F.cosine_similarity(
-                    pred, pred_target, dim=-1
+                    pred_mean, pred_target, dim=-1
                 ).mean().item(),
                 "reward_pred_sparsity": (
                     reward_pred.abs() < 0.1
                 ).float().mean().item(),
             }
+            if pred_logvar_mean is not None:
+                diag["pred_logvar_mean"] = pred_logvar_mean.item()
 
             # ── Long-horizon rollout diagnostic ──
             # Mimics imagination procedure: autoregressive predictor with

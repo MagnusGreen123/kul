@@ -108,14 +108,9 @@ class ActionConditionedPredictor(nn.Module):
     At position t, given (e_t, a_t), predicts e_{t+1}.
     Causal masking ensures position t only sees positions 0..t.
 
-    Args:
-        embed_dim:   Dimension of state embeddings.
-        act_dim:     Action space size.
-        depth:       Number of transformer blocks.
-        heads:       Number of attention heads.
-        mlp_dim:     FFN hidden dimension.
-        max_seq_len: Maximum sequence length (for positional embeddings).
-        dropout:     Dropout rate.
+    Optional stochastic mode (v17): adds a separate head that produces
+    log-variance of a Gaussian distribution over the predicted embedding.
+    Forward returns the mean by default; pass return_dist=True for (mean, log_var).
     """
 
     def __init__(
@@ -127,6 +122,10 @@ class ActionConditionedPredictor(nn.Module):
         mlp_dim: int = 512,
         max_seq_len: int = 32,
         dropout: float = 0.1,
+        stochastic: bool = False,
+        logvar_init: float = -2.0,
+        logvar_min: float = -5.0,
+        logvar_max: float = 2.0,
     ):
         super().__init__()
         dim_head = embed_dim // heads
@@ -149,30 +148,51 @@ class ActionConditionedPredictor(nn.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, embeddings, actions):
+        # Stochastic head: predicts log-variance per dim. Initialized to
+        # output a constant logvar_init (sigma ~ 0.37 for default -2.0)
+        # so training starts close to deterministic and learns to inflate
+        # variance only where the predictor is genuinely uncertain.
+        self.stochastic = stochastic
+        if stochastic:
+            self.logvar_head = nn.Linear(embed_dim, embed_dim)
+            nn.init.zeros_(self.logvar_head.weight)
+            nn.init.constant_(self.logvar_head.bias, logvar_init)
+            self.logvar_min = logvar_min
+            self.logvar_max = logvar_max
+        else:
+            self.logvar_head = None
+            self.logvar_min = logvar_min
+            self.logvar_max = logvar_max
+
+    def forward(self, embeddings, actions, return_dist: bool = False):
         """Predict next-step embeddings.
 
         Args:
-            embeddings: (B, T, D) state embeddings.
-            actions:    (B, T, act_dim) actions taken at each state.
+            embeddings:  (B, T, D) state embeddings.
+            actions:     (B, T, act_dim) actions taken at each state.
+            return_dist: If True and stochastic, returns (mean, log_var)
+                         tuple. Otherwise returns mean only.
 
         Returns:
-            (B, T, D) predicted next-step embeddings.
-            Output at position t is the prediction for e_{t+1}.
+            mean:    (B, T, D) predicted next-step embeddings.
+            log_var: (B, T, D) (only when return_dist=True and stochastic)
         """
         B, T, D = embeddings.shape
 
-        # Encode actions for conditioning
-        act_emb = self.action_encoder(actions)          # (B, T, D)
-
-        # Add positional embeddings
+        act_emb = self.action_encoder(actions)
         x = embeddings + self.pos_embedding[:, :T]
-
-        # Transformer blocks with action conditioning via AdaLN
         for block in self.blocks:
             x = block(x, act_emb)
+        mean = self.norm(x)
 
-        return self.norm(x)
+        if return_dist:
+            if not self.stochastic:
+                raise RuntimeError(
+                    "return_dist=True requires stochastic=True at construction"
+                )
+            log_var = self.logvar_head(mean).clamp(self.logvar_min, self.logvar_max)
+            return mean, log_var
+        return mean
 
 
 if __name__ == "__main__":

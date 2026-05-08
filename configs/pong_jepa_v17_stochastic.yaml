@@ -1,0 +1,97 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning + STOCHASTIC head (v17)
+# Predictor outputs (mean, log_var) of a Gaussian over the next embedding.
+# Training switches to Gaussian NLL; AC imagination samples from the
+# distribution at every imagined step. Initialized so log_var starts at
+# logvar_init (sigma ~ 0.37) -- close to deterministic, learns where
+# uncertainty actually lives.
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+stochastic_predictor: true
+logvar_init: -2.0
+logvar_min: -5.0
+logvar_max: 2.0
+rollout_sample: false  # K-step chain feeds mean (deterministic propagation,
+                       # NLL loss at each step). Imagination still samples.
+
+# SIGReg
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+reward_weight: 10.0
+use_symlog: true
+
+# Auxiliary decoder
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# Actor-critic — v15 baseline (K=5 rollout) with single change: stochastic
+# predictor. Tests whether calibrated uncertainty in imagination produces
+# better policy than deterministic mean rollouts. v15-resumed reached
+# -10.56 @ 501k vs v11's -7.83 (K-step alone was net-neutral or slightly
+# negative). Hypothesis: deterministic predictor is overconfident, AC
+# exploits unrealistic certainty in imagined returns.
+ac_warmup_steps: 20000
+ac_gate_threshold: 0.022          # matches v15-resumed; pred_loss is MSE-equivalent
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# K-step autoregressive rollout training (kept from v15)
+rollout_steps: 5
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule -- full 500k from scratch (not a resume; predictor architecture changed)
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+eval_every: 20000
+
+# Buffer
+buffer_max_steps: 200000
+
+# Breakthrough tracking
+reward_window_size: 50
+best_window_min_eps: 30
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v17-stochastic"

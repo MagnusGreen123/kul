@@ -207,9 +207,20 @@ class JEPAActorCriticTrainer:
                 ctx_embs = torch.stack(emb_buffer[-HS:], dim=1)  # (B, L, D)
                 ctx_acts = torch.stack(act_buffer[-HS:], dim=1)   # (B, L, act_dim)
 
-                # Predict next embedding — clamp to prevent drift over H steps
-                pred = self.world_model.predictor(ctx_embs, ctx_acts)
-                next_emb = pred[:, -1].clamp(-10, 10)  # (B, D)
+                # Predict next embedding — clamp to prevent drift over H steps.
+                # Stochastic predictor (v17): sample from N(mean, sigma^2) at
+                # every imagined step. This adds calibrated noise to imagined
+                # trajectories so the policy can't exploit overconfident
+                # deterministic rollouts.
+                if getattr(self.world_model.predictor, "stochastic", False):
+                    mean, log_var = self.world_model.predictor(
+                        ctx_embs, ctx_acts, return_dist=True
+                    )
+                    std = (0.5 * log_var[:, -1]).exp()
+                    next_emb = (mean[:, -1] + std * torch.randn_like(mean[:, -1])).clamp(-10, 10)
+                else:
+                    pred = self.world_model.predictor(ctx_embs, ctx_acts)
+                    next_emb = pred[:, -1].clamp(-10, 10)
                 emb_buffer.append(next_emb)
 
                 # Predict reward, value, continuation from next state

@@ -99,9 +99,29 @@ class JEPAActorCriticTrainer:
             self.critic_opt, critic_lr_lambda
         )
 
-        # Real TD target weight (reality anchor for critic)
+        # Real TD target weight (reality anchor for critic; v12 1-step variant)
         self.real_td_weight = cfg.get("real_td_weight", 0.0)
         self.use_symlog = cfg.get("use_symlog", True)
+
+        # v18: Replay critic loss (DreamerV3-style lambda-returns on real
+        # buffer trajectories). β_repval=0.3 default (matches DreamerV3 paper).
+        # When > 0, critic loss = (1 - repval_weight) * imagination_loss
+        #                       + repval_weight * replay_loss
+        # This bypasses the AC-gate deadlock: critic learns from real returns
+        # even when world-model imagination is poor.
+        self.repval_weight = cfg.get("repval_weight", 0.0)
+
+        # v18: Imagination horizon curriculum.
+        # h(step) = min(1 + step // ramp, max_horizon) where ramp ensures
+        # horizon reaches max_horizon at step = horizon_curriculum_steps.
+        # When ramp_steps == 0 (default), horizon stays fixed at self.horizon.
+        # Source: NOVEL_TECHNIQUES.md #3 — smooths regime shift in returns
+        # that caused v6's collapse from +11 → -12 in 40k steps.
+        self.horizon_curriculum_steps = cfg.get("horizon_curriculum_steps", 0)
+        self.max_horizon = self.horizon  # store original target
+        self._current_horizon = (
+            1 if self.horizon_curriculum_steps > 0 else self.horizon
+        )
 
         # Return normalization — EMA of 5th/95th percentiles (for actor only)
         self._return_ema_low = None
@@ -170,6 +190,60 @@ class JEPAActorCriticTrainer:
 
         return self.critic.compute_loss(emb_t, td_target)
 
+    def _compute_replay_critic_loss(self, emb_seq, rewards, dones):
+        """v18: DreamerV3-style replay critic loss on real trajectories.
+
+        Computes lambda-returns over the full real sequence using the target
+        critic's value at the horizon end as bootstrap. Critic is then trained
+        to predict these lambda-returns at each timestep — exactly like the
+        imagination critic loss, but with REAL rewards and embeddings.
+
+        Anchors critic to ground truth, prevents value-overestimation when
+        imagination diverges (v6 Phase 3 collapse mechanism), and bypasses
+        the AC-gate deadlock for fresh runs.
+
+        Args:
+            emb_seq: (B, T, D) real embeddings
+            rewards: (B, T) real rewards (per arrival convention)
+            dones:   (B, T) done flags or None
+
+        Returns:
+            scalar loss
+        """
+        B, T, D = emb_seq.shape
+        emb_seq_d = emb_seq.detach()
+        # Train critic on positions [0 .. T-2]; use position T-1 as bootstrap.
+        rew = rewards[:, :T - 1]
+        rew = symlog(rew) if self.use_symlog else rew
+        rew = rew.clamp(-5, 5)
+
+        if dones is not None:
+            cont = 1.0 - dones[:, :T - 1]
+        else:
+            cont = torch.ones_like(rew)
+
+        with torch.no_grad():
+            values = self.target_critic(emb_seq_d).clamp(-10, 10)  # (B, T)
+            # Use values at positions [1 .. T-1] as next-step bootstraps,
+            # plus value at T-1 for the terminal lambda-return.
+            replay_returns = compute_lambda_returns(
+                rew, values[:, 1:].clone(),
+                self.gamma, self.lambda_, continuations=cont,
+            )
+            replay_returns = replay_returns.clamp(-10, 10)
+
+        return self.critic.compute_loss(emb_seq_d[:, :T - 1], replay_returns)
+
+    def _update_curriculum(self, global_step: int):
+        """Update self._current_horizon from global_step. No-op if curriculum disabled."""
+        if self.horizon_curriculum_steps <= 0:
+            self._current_horizon = self.max_horizon
+            return
+        ramp = self.horizon_curriculum_steps
+        # Linear ramp 1 → max_horizon over 'ramp' steps
+        h = 1 + (global_step * (self.max_horizon - 1)) // max(1, ramp)
+        self._current_horizon = max(1, min(h, self.max_horizon))
+
     def imagine_rollout(self, initial_emb):
         """Roll out in imagination using actor + predictor.
 
@@ -190,7 +264,10 @@ class JEPAActorCriticTrainer:
         reward_list, value_list = [], []
         log_prob_list, entropy_list, cont_list = [], [], []
 
-        for step_i in range(self.horizon):
+        # v18: Use curriculum-controlled horizon (defaults to self.horizon when
+        # curriculum is disabled). Always at least 1 to keep AC alive.
+        effective_horizon = max(1, self._current_horizon)
+        for step_i in range(effective_horizon):
             current_emb = emb_buffer[-1]
 
             # Bail early if embeddings went NaN (prevents corrupting actor)
@@ -260,17 +337,21 @@ class JEPAActorCriticTrainer:
             torch.stack(cont_list, dim=1),       # (B, H)
         )
 
-    def train_step(self, emb_seq, dones=None, real_rewards=None):
+    def train_step(self, emb_seq, dones=None, real_rewards=None, global_step: int = 0):
         """Train actor and critic from world model embeddings.
 
         Args:
             emb_seq:      (B, T, D) embeddings from JEPA world model
             dones:        (B, T) done flags (optional)
             real_rewards: (B, T) real rewards for TD anchor (optional)
+            global_step:  current training step (for v18 horizon curriculum)
 
         Returns:
             dict of losses
         """
+        # v18: Update curriculum horizon before rollout
+        self._update_curriculum(global_step)
+
         B, T, _ = emb_seq.shape
 
         # Pick random starting states, avoiding terminal and last step
@@ -339,7 +420,7 @@ class JEPAActorCriticTrainer:
             emb_imag.detach(), lambda_returns.detach()
         )
 
-        # ── Real TD anchor (v12+) ── breaks self-reinforcing feedback loop
+        # ── Real TD anchor (v12+, 1-step) ── kept for backwards compat
         real_td_loss_val = 0.0
         if self.real_td_weight > 0 and real_rewards is not None:
             real_td_loss = self._compute_real_td_loss(emb_seq, real_rewards, dones)
@@ -347,6 +428,22 @@ class JEPAActorCriticTrainer:
             real_td_loss_val = real_td_loss.item()
         else:
             critic_loss = imag_critic_loss
+
+        # ── v18: Replay critic loss (DreamerV3-style λ-returns on real data) ──
+        # critic_loss = (1 - β_repval) * imagination_loss + β_repval * replay_loss
+        # β_repval = 0.3 in DreamerV3 paper. Anchors critic to real-trajectory
+        # returns even when imagination is bad. Critical for breaking the
+        # AC-gate deadlock and surviving the +11 distributional shift.
+        replay_critic_loss_val = 0.0
+        if self.repval_weight > 0 and real_rewards is not None:
+            replay_critic_loss = self._compute_replay_critic_loss(
+                emb_seq, real_rewards, dones
+            )
+            critic_loss = (
+                (1.0 - self.repval_weight) * critic_loss
+                + self.repval_weight * replay_critic_loss
+            )
+            replay_critic_loss_val = replay_critic_loss.item()
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -380,6 +477,8 @@ class JEPAActorCriticTrainer:
             "imag_emb_norm_end": imag_norm_end,
             "return_scale": return_scale,
             "real_td_loss": real_td_loss_val,
+            "replay_critic_loss": replay_critic_loss_val,
+            "current_horizon": float(self._current_horizon),
             "critic_lr": self.critic_opt.param_groups[0]["lr"],
         }
 

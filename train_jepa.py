@@ -449,6 +449,7 @@ def main():
                     ac_losses = ac_trainer.train_step(
                         wm_info["emb_seq"], dones=wm_info.get("dones"),
                         real_rewards=batch["reward"].to(device),
+                        global_step=global_step,
                     )
                 else:
                     ac_losses = {}

@@ -1,0 +1,120 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+# v18: deterministic predictor (stochastic disabled — v17 lesson: NLL gives
+# logvar an escape valve, gate never opened). Compositional pressure comes
+# from EMA target + BYOL projection heads instead.
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+# SIGReg — kept (anti-collapse via marginal isotropy; LeWM-style)
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# ── v18 mechanism #1: EMA target encoder + BYOL projection/prediction heads ──
+# Source: SPR (Schwarzer 2020), BYOL (Grill 2020).
+# Purpose: encoder gets asymmetric prediction pressure from a lagged copy of
+# itself. SIGReg alone is anti-collapse but doesn't drive task-relevant
+# feature learning (probe data: encoder static across 300k v13 training).
+# decay=0.99 matches SPR's momentum-tau=0.01 for Pong.
+use_ema_target: true
+target_ema_decay: 0.99
+
+# ── v18 mechanism #2: Inverse dynamics aux head ──
+# Source: MuDreamer (2024) — "particularly beneficial for sparse reward".
+# Predicts a_t from (emb_t, emb_{t+1}). Forces encoder to encode action-
+# distinguishing features (paddle position for Pong). Weight 0.3 = low,
+# worst case is no-op aux loss; best case forces paddle/ball features.
+inv_dyn_weight: 0.3
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+reward_weight: 10.0
+use_symlog: true
+
+# Auxiliary decoder — KEPT at v11 weight (commit e27868d showed encoder
+# discards ball without it). Adds pixel-level pressure complementary to
+# the inverse-dynamics aux signal.
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# Actor-critic — v11/v6 fast critic regime (the one that actually learned)
+ac_warmup_steps: 20000
+ac_gate_threshold: 0.022    # gate kept as backup; replay critic provides redundancy
+act_dim: 6
+mlp_units: 400
+horizon: 15                 # max horizon (curriculum ramps to this)
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98      # v6's fast target updates
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+# ── v18 mechanism #3: Replay critic loss (DreamerV3-style) ──
+# Source: DreamerV3 (Hafner 2023).
+# Critic trains on lambda-returns from REAL buffer trajectories with weight
+# β_repval=0.3, plus imagination-based loss with weight (1-β_repval)=0.7.
+# Anchors critic to ground truth, breaks AC-gate deadlock, prevents value
+# overestimation when imagination diverges (v6 Phase 3 collapse mechanism).
+repval_weight: 0.3
+
+# ── v18 mechanism #4: Imagination horizon curriculum ──
+# Source: NOVEL_TECHNIQUES.md #3 (own proposal).
+# horizon ramps linearly from 1 → 15 over 200k steps. Smooths the regime
+# shift in returns that caused v6's collapse from +11 → -12 in 40k steps.
+# Critic calibrates on short-horizon returns first; predictor compounds
+# error less; full horizon arrives only after early learning is solid.
+horizon_curriculum_steps: 200000
+
+# K-step autoregressive rollout training in WM (kept from v15)
+# Even with curriculum reducing AC imagination horizon, WM trains predictor
+# on K=5 sequences so predictor can extrapolate when curriculum reaches 15.
+rollout_steps: 5
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+eval_every: 20000
+
+# Buffer — v11 setting (200k = ~250 episodes, fresh data)
+buffer_max_steps: 200000
+
+# Breakthrough tracking
+reward_window_size: 50
+best_window_min_eps: 30
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v18-byol-replay-curriculum"

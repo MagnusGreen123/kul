@@ -2,14 +2,22 @@
 JEPA world model: encoder + predictor + SIGReg + reward/continuation heads.
 
 Replaces RSSM + reconstruction loss with:
-  - Prediction loss: MSE between predicted and actual next-step embeddings
-  - Rollout loss: 2-step prediction through predictor's own outputs
+  - Prediction loss: MSE or BYOL-cosine on EMA target (v18)
+  - Rollout loss: K-step prediction through predictor's own outputs
   - SIGReg: enforces isotropic Gaussian embeddings (no stop-gradient/EMA)
   - Reward/continuation prediction from embeddings
+  - Inverse dynamics aux head (v18): encoder must encode action-distinguishing
+    features (paddle position for Pong)
 
-End-to-end training: gradients flow through encoder from all losses.
-No decoder, no KL, no prior/posterior split.
+v18 additions (behind config flags):
+  - use_ema_target: BYOL-style EMA target encoder + projection/prediction heads.
+    Online encoder gets gradient only through input side; target side is
+    detached EMA. Source: SPR (Schwarzer 2020), BYOL (Grill 2020).
+  - inv_dyn_weight: inverse dynamics head predicts a_t from (emb_t, emb_{t+1}).
+    Source: MuDreamer (2024).
 """
+
+import copy
 
 import torch
 import torch.nn as nn
@@ -96,6 +104,62 @@ class JEPAWorldModel(nn.Module):
             self.aux_decoder = None
             self.fg_weight = 0.0
 
+        # ── v18: EMA target encoder + BYOL projection/prediction heads ──
+        # When use_ema_target is True, prediction loss switches to BYOL-style:
+        #   online_pred = prediction_head(projection_head(predictor_output))
+        #   target = stop_grad(target_projection_head(target_encoder(o_{t+1})))
+        #   loss = 1 - cosine(online_pred, target)
+        # The target_encoder and target_projection_head are EMA copies of the
+        # online versions, updated in update_target_networks() after each step.
+        self.use_ema_target = cfg.get("use_ema_target", False)
+        self.target_ema_decay = cfg.get("target_ema_decay", 0.99)
+        if self.use_ema_target:
+            # BYOL projection head (online, with grad)
+            self.online_projection_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            # BYOL prediction head (asymmetric, online side only)
+            self.online_prediction_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            # EMA copies (target side, no grad)
+            self.target_encoder = copy.deepcopy(self.encoder)
+            self.target_encoder_bn = copy.deepcopy(self.encoder_bn)
+            self.target_projection_head = copy.deepcopy(self.online_projection_head)
+            for p in self.target_encoder.parameters():
+                p.requires_grad_(False)
+            for p in self.target_encoder_bn.parameters():
+                p.requires_grad_(False)
+            for p in self.target_projection_head.parameters():
+                p.requires_grad_(False)
+        else:
+            self.online_projection_head = None
+            self.online_prediction_head = None
+            self.target_encoder = None
+            self.target_encoder_bn = None
+            self.target_projection_head = None
+
+        # ── v18: Inverse dynamics aux head ──
+        # Predicts action a_t from (emb_t, emb_{t+1}). Forces encoder to
+        # encode action-distinguishing features. Disabled when weight = 0.
+        self.inv_dyn_weight = cfg.get("inv_dyn_weight", 0.0)
+        if self.inv_dyn_weight > 0:
+            self.inv_dyn_head = nn.Sequential(
+                nn.Linear(2 * embed_dim, mlp_units),
+                nn.ELU(),
+                nn.Linear(mlp_units, mlp_units),
+                nn.ELU(),
+                nn.Linear(mlp_units, act_dim),
+            )
+        else:
+            self.inv_dyn_head = None
+
         # Loss weights
         self.pred_weight = cfg.get("pred_weight", 1.0)
         self.rollout_weight = cfg.get("rollout_weight", 0.5)
@@ -104,6 +168,7 @@ class JEPAWorldModel(nn.Module):
         self.use_symlog = cfg.get("use_symlog", True)
 
         self.embed_dim = embed_dim
+        self.act_dim = act_dim
         self.history_size = cfg.get("history_size", 3)
         self.rollout_steps = cfg.get("rollout_steps", 2)
 
@@ -127,6 +192,51 @@ class JEPAWorldModel(nn.Module):
         x = x.clamp(-10, 10)
         return x
 
+    @torch.no_grad()
+    def encode_target(self, obs):
+        """Encode using the EMA target encoder. No gradient.
+
+        Returns the same shape as encode(). Caller must ensure use_ema_target.
+        """
+        x = self.target_encoder(obs)
+        has_time = x.dim() == 3
+        if has_time:
+            B, T, D = x.shape
+            x = self.target_encoder_bn(x.reshape(B * T, D)).reshape(B, T, D)
+        else:
+            x = self.target_encoder_bn(x)
+        x = x.clamp(-10, 10)
+        return x
+
+    @torch.no_grad()
+    def update_target_networks(self):
+        """EMA update of target encoder, target BN, target projection head.
+        Call once per WM training step. No-op if use_ema_target is False.
+        """
+        if not self.use_ema_target:
+            return
+        decay = self.target_ema_decay
+        for online_p, target_p in zip(
+            self.encoder.parameters(), self.target_encoder.parameters()
+        ):
+            target_p.data.mul_(decay).add_(online_p.data, alpha=1.0 - decay)
+        for online_p, target_p in zip(
+            self.encoder_bn.parameters(), self.target_encoder_bn.parameters()
+        ):
+            target_p.data.mul_(decay).add_(online_p.data, alpha=1.0 - decay)
+        # BatchNorm running stats also need to follow online
+        self.target_encoder_bn.running_mean.data.mul_(decay).add_(
+            self.encoder_bn.running_mean.data, alpha=1.0 - decay
+        )
+        self.target_encoder_bn.running_var.data.mul_(decay).add_(
+            self.encoder_bn.running_var.data, alpha=1.0 - decay
+        )
+        for online_p, target_p in zip(
+            self.online_projection_head.parameters(),
+            self.target_projection_head.parameters(),
+        ):
+            target_p.data.mul_(decay).add_(online_p.data, alpha=1.0 - decay)
+
     def forward(self, obs, actions, rewards, dones=None):
         """Forward pass for training.
 
@@ -144,6 +254,20 @@ class JEPAWorldModel(nn.Module):
         # ── Encode all observations ──
         embeddings = self.encode(obs)  # (B, T, D)
 
+        # ── v18: Compute EMA target embeddings if enabled ──
+        # target_emb is the BYOL "target" — what the predictor should match.
+        # Stop-gradient: target side never receives gradient.
+        if self.use_ema_target:
+            target_emb = self.encode_target(obs).detach()        # (B, T, D)
+            # Project once for full sequence; reuse for pred + rollout
+            # (apply BN equivalent through the LayerNorm in projection head)
+            target_proj_seq = self.target_projection_head(
+                target_emb.reshape(B * T, self.embed_dim)
+            ).reshape(B, T, self.embed_dim).detach()             # (B, T, D)
+        else:
+            target_emb = None
+            target_proj_seq = None
+
         # ── SIGReg: enforce N(0, I) on embeddings ──
         # Subsample to fixed size so the Epps-Pulley * N term doesn't scale
         # with batch_size * batch_length (which was 15360 and made SIGReg
@@ -158,11 +282,32 @@ class JEPAWorldModel(nn.Module):
         # ── Teacher-forcing prediction ──
         # (e_t, a_t) -> predict e_{t+1}
         # No action shifting: a_t is the action taken AT state t.
-        # Stochastic mode (v17): predictor returns (mean, log_var). Training
-        # loss is Gaussian NLL; wm/pred logging stays as MSE for fair
-        # comparison with deterministic baselines (v11, v15).
-        pred_target = embeddings[:, 1:]  # (B, T-1, D)
-        if self.stochastic_predictor:
+        # Three modes:
+        #   (a) v18 BYOL: predictor → projection → prediction; target is
+        #       EMA target_proj. Loss = 1 - cosine(online_pred, target_proj).
+        #   (b) v17 stochastic: predictor returns (mean, log_var). NLL loss.
+        #   (c) v11/v15 deterministic MSE: predictor → MSE against online emb.
+        # wm/pred metric is always MSE-equivalent (against online or target
+        # embedding) so AC gate threshold stays cross-version comparable.
+        if self.use_ema_target:
+            # Predictor still operates in embedding space — just like v15.
+            pred = self.predictor(embeddings[:, :-1], actions[:, :-1])  # (B,T-1,D)
+            # MSE-equivalent metric for gate (predictor output vs target emb)
+            pred_mse = F.mse_loss(pred, target_emb[:, 1:])
+            # BYOL training loss: project + predict, cosine sim against EMA target
+            pred_proj = self.online_projection_head(
+                pred.reshape(B * (T - 1), self.embed_dim)
+            )
+            pred_proj = self.online_prediction_head(pred_proj)
+            pred_proj = pred_proj.reshape(B, T - 1, self.embed_dim)
+            target_for_pred = target_proj_seq[:, 1:]  # already detached
+            cos_sim = F.cosine_similarity(pred_proj, target_for_pred, dim=-1)  # (B,T-1)
+            pred_byol = (1.0 - cos_sim).mean()
+            pred_loss = pred_byol
+            pred_mean = pred  # for diagnostic cosine
+            pred_logvar_mean = None
+        elif self.stochastic_predictor:
+            pred_target = embeddings[:, 1:]
             pred_mean, pred_logvar = self.predictor(
                 embeddings[:, :-1], actions[:, :-1], return_dist=True
             )
@@ -174,6 +319,7 @@ class JEPAWorldModel(nn.Module):
             pred_loss = pred_nll
             pred_logvar_mean = pred_logvar.mean().detach()
         else:
+            pred_target = embeddings[:, 1:]
             pred = self.predictor(embeddings[:, :-1], actions[:, :-1])
             pred_mse = F.mse_loss(pred, pred_target)
             pred_loss = pred_mse
@@ -198,18 +344,35 @@ class JEPAWorldModel(nn.Module):
             for k in range(K):
                 ctx_e = torch.stack(emb_buffer[-HS:], dim=1)
                 ctx_a = torch.stack(act_buffer[-HS:], dim=1)
-                target = embeddings[:, HS + k]
+                # Online emb target is used for MSE metric and (when not BYOL) for training
+                online_target = embeddings[:, HS + k]
 
-                if self.stochastic_predictor:
+                if self.use_ema_target:
+                    # BYOL rollout: predictor output → online proj+pred,
+                    # target = stop_grad EMA-projected next observation
+                    pred_seq = self.predictor(ctx_e, ctx_a)
+                    next_pred_emb = pred_seq[:, -1].clamp(-10, 10)
+                    step_proj = self.online_projection_head(next_pred_emb)
+                    step_proj = self.online_prediction_head(step_proj)
+                    step_target = target_proj_seq[:, HS + k]  # already detached
+                    cos = F.cosine_similarity(step_proj, step_target, dim=-1)
+                    step_loss_train = (1.0 - cos).mean()
+                    rollout_terms_train.append(step_loss_train)
+                    # MSE-equivalent for metric (vs target encoder embedding)
+                    rollout_terms_mse.append(
+                        F.mse_loss(next_pred_emb, target_emb[:, HS + k]).detach()
+                    )
+                    next_pred = next_pred_emb
+                elif self.stochastic_predictor:
                     m_seq, lv_seq = self.predictor(ctx_e, ctx_a, return_dist=True)
                     next_mean = m_seq[:, -1].clamp(-10, 10)
                     next_logvar = lv_seq[:, -1]
                     nll = 0.5 * (
-                        (next_mean - target) ** 2 * (-next_logvar).exp() + next_logvar
+                        (next_mean - online_target) ** 2 * (-next_logvar).exp() + next_logvar
                     ).mean()
                     rollout_terms_train.append(nll)
                     rollout_terms_mse.append(
-                        F.mse_loss(next_mean, target).detach()
+                        F.mse_loss(next_mean, online_target).detach()
                     )
                     if self.rollout_sample:
                         std = (0.5 * next_logvar).exp()
@@ -219,7 +382,7 @@ class JEPAWorldModel(nn.Module):
                 else:
                     pred_seq = self.predictor(ctx_e, ctx_a)
                     next_pred = pred_seq[:, -1].clamp(-10, 10)
-                    step_mse = F.mse_loss(next_pred, target)
+                    step_mse = F.mse_loss(next_pred, online_target)
                     rollout_terms_train.append(step_mse)
                     rollout_terms_mse.append(step_mse.detach())
 
@@ -275,6 +438,21 @@ class JEPAWorldModel(nn.Module):
         else:
             aux_recon_loss = torch.zeros(1, device=obs.device)
 
+        # ── v18: Inverse dynamics aux head ──
+        # Predict a_t from (emb_t, emb_{t+1}). Cross-entropy. Forces encoder
+        # to encode action-distinguishing features (paddle position).
+        if self.inv_dyn_head is not None and T >= 2:
+            inv_in = torch.cat([embeddings[:, :-1], embeddings[:, 1:]], dim=-1)  # (B,T-1,2D)
+            inv_logits = self.inv_dyn_head(inv_in.reshape(B * (T - 1), 2 * self.embed_dim))
+            # actions are one-hot (B, T, act_dim) — convert to indices
+            action_targets = actions[:, :-1].argmax(dim=-1).reshape(B * (T - 1))
+            inv_dyn_loss = F.cross_entropy(inv_logits, action_targets)
+            with torch.no_grad():
+                inv_dyn_acc = (inv_logits.argmax(dim=-1) == action_targets).float().mean()
+        else:
+            inv_dyn_loss = torch.zeros(1, device=obs.device)
+            inv_dyn_acc = torch.zeros(1, device=obs.device)
+
         # ── Total loss ──
         total_loss = (
             self.pred_weight * pred_loss
@@ -283,31 +461,49 @@ class JEPAWorldModel(nn.Module):
             + self.reward_weight * reward_loss
             + cont_loss
             + self.aux_recon_weight * aux_recon_loss
+            + self.inv_dyn_weight * inv_dyn_loss
         )
 
-        # Logged "pred" / "rollout" stay MSE so wm/pred is comparable across
-        # deterministic and stochastic versions (gate threshold, plots, etc.).
-        # Training uses pred_loss / rollout_loss which equal NLL in stochastic
-        # mode and MSE otherwise.
+        # Logged "pred" / "rollout" stay MSE-equivalent so wm/pred is comparable
+        # across deterministic, stochastic, and BYOL versions (gate threshold,
+        # plots). Training uses pred_loss / rollout_loss which equal:
+        #   - BYOL cosine loss (v18) when use_ema_target
+        #   - NLL when stochastic_predictor
+        #   - MSE otherwise
+        if self.use_ema_target or self.stochastic_predictor:
+            pred_metric = pred_mse
+            rollout_metric = rollout_loss_mse
+        else:
+            pred_metric = pred_loss
+            rollout_metric = rollout_loss
         losses = {
             "total": total_loss,
-            "pred": pred_mse if self.stochastic_predictor else pred_loss,
-            "rollout": rollout_loss_mse if self.stochastic_predictor else rollout_loss,
+            "pred": pred_metric,
+            "rollout": rollout_metric,
             "sigreg": sigreg_loss,
             "reward": reward_loss,
             "cont": cont_loss,
             "aux_recon": aux_recon_loss,
+            "inv_dyn": inv_dyn_loss,
         }
         if self.stochastic_predictor:
             losses["pred_nll"] = pred_loss.detach()
             losses["rollout_nll"] = rollout_loss.detach() if torch.is_tensor(rollout_loss) else rollout_loss
+        if self.use_ema_target:
+            losses["pred_byol"] = pred_loss.detach()
+            losses["rollout_byol"] = rollout_loss.detach() if torch.is_tensor(rollout_loss) else rollout_loss
         # ── Inline diagnostics (cheap stats on existing tensors) ──
         with torch.no_grad():
+            # pred_cosine compares predictor output to actual next embedding
+            # (online encoder for non-BYOL modes, target encoder for BYOL)
+            cos_target = (
+                target_emb[:, 1:] if self.use_ema_target else embeddings[:, 1:]
+            )
             diag = {
                 "emb_mean": embeddings.mean().item(),
                 "emb_std": embeddings.std().item(),
                 "pred_cosine": F.cosine_similarity(
-                    pred_mean, pred_target, dim=-1
+                    pred_mean, cos_target, dim=-1
                 ).mean().item(),
                 "reward_pred_sparsity": (
                     reward_pred.abs() < 0.1
@@ -315,6 +511,8 @@ class JEPAWorldModel(nn.Module):
             }
             if pred_logvar_mean is not None:
                 diag["pred_logvar_mean"] = pred_logvar_mean.item()
+            if self.inv_dyn_head is not None:
+                diag["inv_dyn_acc"] = inv_dyn_acc.item()
 
             # ── Long-horizon rollout diagnostic ──
             # Mimics imagination procedure: autoregressive predictor with
@@ -416,6 +614,9 @@ class JEPAWorldModelTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.scheduler.step()
+
+        # v18: EMA update of target encoder/projection (no-op when disabled)
+        self.model.update_target_networks()
 
         info = {k: v.float() if torch.is_tensor(v) and v.is_floating_point() else v
                 for k, v in info.items()}

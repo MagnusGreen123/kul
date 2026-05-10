@@ -53,7 +53,13 @@ fg_weight: 50.0
 
 # Actor-critic — v11/v6 fast critic regime (the one that actually learned)
 ac_warmup_steps: 20000
-ac_gate_threshold: 0.022    # gate kept as backup; replay critic provides redundancy
+# v18 gate-fix (2026-05-10): null disables metric gate. The original 0.022
+# threshold was on wm/pred (MSE-equivalent metric) — but in BYOL mode the
+# optimizer trains pred_byol (cosine in projection space), so wm/pred stays
+# stuck at ~0.6 and the gate never opens. Replay critic + warmup is now the
+# only gate. Verified at step 272k: encoder healthy (inv_dyn_acc=0.927,
+# rollout_cosine_15step=0.605, emb_std=1.01) but AC never trained.
+ac_gate_threshold: null
 act_dim: 6
 mlp_units: 400
 horizon: 15                 # max horizon (curriculum ramps to this)

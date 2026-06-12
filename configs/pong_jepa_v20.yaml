@@ -1,0 +1,149 @@
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+# SIGReg — kept (anti-collapse via marginal isotropy; LeWM-style)
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# ── EMA target encoder (kept from v18) ──
+use_ema_target: true
+target_ema_decay: 0.99
+
+# ── v19 fix #1: predictor trained with MSE in EMBEDDING space ──
+# v18 lesson (run woofbf2z): BYOL projection-space loss on the predictor
+# degenerates raw-space output (cosine 0.99 -> 0.68), imagination feeds OOD
+# embeddings to reward/critic, critic value estimates flip sign (+0.5 vs
+# -2.9). The predictor MUST be anchored in the space imagination consumes.
+# Target = EMA target embeddings (more stable than online).
+predictor_loss: mse_target
+
+# ── v19 fix #2: BYOL moved to ENCODER-ONLY aux ──
+# Same-timestep self-distillation: online emb -> proj -> pred vs stop-grad
+# EMA target proj. Keeps v18's encoder pressure (the part that worked:
+# inv_dyn_acc 0.95) without the predictor in the loop. Ablation flag.
+byol_encoder_weight: 0.3
+
+# ── Inverse dynamics aux head (kept from v18 — verified healthy) ──
+inv_dyn_weight: 0.3
+
+# ── v20: action-conditioned CPC aux on the encoder ──
+# TWISTER-inspired (ICLR 2025) InfoNCE over K horizons. Forces the encoder
+# to capture what DISCRIMINATES futures (small task-relevant objects that
+# MSE/reconstruction underweight — ball-region MSE was 15-20x playfield).
+# Environment-agnostic by design: in-batch negatives, normalized
+# projections, fixed temperature; no Pong-specific constants.
+# Targets from EMA target encoder (stop-grad). Weight ramps over
+# cpc_ramp_steps env steps (review Phase 2B guarantee #4).
+cpc_weight: 0.5
+cpc_horizons: [1, 3, 5]
+cpc_proj_dim: 128
+cpc_hidden_dim: 256
+cpc_temperature: 0.1
+cpc_var_weight: 1.0          # variance hinge on pre-norm projections (anti-collapse)
+cpc_ramp_steps: 20000
+cpc_max_samples: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+use_symlog: true
+
+# ── v19 fix #3: reward loss per-event instead of per-frame-sum ──
+# Old `.sum(dim=1)` x weight 10 = effective 300x/frame whose optimum on
+# ~0.5% non-zero-reward Pong is constant 0 (v18: sparsity 0.98, imagination
+# rewards ~0). Weighted mean with 30x upweight on reward events makes the
+# events dominate. Watch wm/reward_event_mse — THAT must fall, not the total.
+reward_weight: 10.0
+reward_loss_mode: event
+reward_event_weight: 30.0
+
+# Auxiliary decoder — KEPT for v20 (commit e27868d: ball disappears without
+# it). Planned ablation once CPC is verified: aux_recon_weight 0 to test
+# whether CPC replaces pixel reconstruction (pure-JEPA claim + transfer to
+# visually rich environments where fg-weighting misfires).
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# Actor-critic — v11/v6 fast critic regime
+ac_warmup_steps: 20000
+# Gate stays disabled (v18 decision). Kill-gates are manual, pre-registered:
+#   @100k: pred_cosine > 0.95 AND value_mean_pred < 0 (right sign) AND
+#          critic_divergence < 50% of v18 reference — else kill + diagnose
+#          (rerun with cpc_weight: 0 = v19 config to isolate)
+#   @150k: window_avg > -15 — else kill
+#   @500k success: window_avg > -5 AND eval/greedy_reward consistent
+ac_gate_threshold: null
+act_dim: 6
+mlp_units: 400
+horizon: 15                 # max horizon (curriculum ramps to this)
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+# Replay critic loss (kept from v18 — verified working: fits real returns)
+repval_weight: 0.3
+
+# ── v19 fix #4: horizon curriculum keyed to AC TRAIN steps ──
+# The v18 global_step variant was a silent no-op on resume and ramps before
+# AC starts on fresh runs. 45000 AC steps ~= 180k env steps after AC start
+# (train_ratio 0.25), so full horizon ~200k env steps into the run.
+horizon_curriculum_ac_steps: 45000
+
+# K-step autoregressive rollout training in WM (kept from v15)
+rollout_steps: 5
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+
+# ── v19 fix #5: greedy eval (argmax policy) — previously dead config ──
+eval_every: 20000
+eval_episodes: 3
+frozen_eval_batch_size: 64
+
+# Buffer — v11 setting (200k = ~250 episodes, fresh data)
+buffer_max_steps: 200000
+
+# Breakthrough tracking
+reward_window_size: 50
+best_window_min_eps: 30
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v20-cpc-msepred"

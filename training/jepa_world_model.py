@@ -34,6 +34,7 @@ from models.jepa_predictor import ActionConditionedPredictor
 from models.sigreg import SIGReg
 from models.reward_predictor import RewardPredictor
 from models.cont_predictor import ContPredictor
+from models.cpc import ActionConditionedCPC
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -145,6 +146,52 @@ class JEPAWorldModel(nn.Module):
             self.target_encoder_bn = None
             self.target_projection_head = None
 
+        # ── v19/v20: predictor loss mode ──
+        # "byol" (v18): predictor trained via projection-space cosine. VERIFIED
+        #   DEAD END — raw-space output degenerates (cosine 0.99 -> 0.68),
+        #   imagination feeds OOD embeddings to reward/critic, value estimates
+        #   flip sign. Kept only for v18 reproducibility.
+        # "mse_target" (v19+): predictor trained with MSE against the EMA
+        #   target embedding — stays anchored in the space imagination consumes,
+        #   with a more stable target than the online encoder.
+        # "mse" (v11/v15): MSE against online embeddings (use_ema_target=False).
+        if self.use_ema_target:
+            self.predictor_loss_mode = cfg.get("predictor_loss", "byol")
+        else:
+            self.predictor_loss_mode = "mse"
+        if self.predictor_loss_mode == "mse_target" and not self.use_ema_target:
+            raise ValueError("predictor_loss=mse_target requires use_ema_target=true")
+
+        # ── v19/v20: BYOL as ENCODER-ONLY aux (same-timestep self-distillation)
+        # online emb -> projection -> prediction vs stop-grad EMA target proj.
+        # Keeps the SPR-style encoder pressure from v18 WITHOUT the predictor
+        # in the loop. Reuses the existing projection/prediction heads.
+        self.byol_encoder_weight = cfg.get("byol_encoder_weight", 0.0)
+        if self.byol_encoder_weight > 0 and not self.use_ema_target:
+            raise ValueError("byol_encoder_weight requires use_ema_target=true")
+
+        # ── v20: action-conditioned CPC aux on the encoder ──
+        # TWISTER-inspired InfoNCE over K horizons. Targets come from the EMA
+        # target encoder (stop-grad). Weight ramps 0 -> cpc_weight over
+        # cpc_ramp_steps env steps (review guarantee #4).
+        self.cpc_weight = cfg.get("cpc_weight", 0.0)
+        self.cpc_ramp_steps = cfg.get("cpc_ramp_steps", 0)
+        if self.cpc_weight > 0:
+            if not self.use_ema_target:
+                raise ValueError("cpc_weight requires use_ema_target=true")
+            self.cpc = ActionConditionedCPC(
+                embed_dim=embed_dim,
+                act_dim=act_dim,
+                horizons=tuple(cfg.get("cpc_horizons", [1, 3, 5])),
+                proj_dim=cfg.get("cpc_proj_dim", 128),
+                hidden_dim=cfg.get("cpc_hidden_dim", 256),
+                temperature=cfg.get("cpc_temperature", 0.1),
+                var_weight=cfg.get("cpc_var_weight", 1.0),
+                max_samples=cfg.get("cpc_max_samples", 1024),
+            )
+        else:
+            self.cpc = None
+
         # ── v18: Inverse dynamics aux head ──
         # Predicts action a_t from (emb_t, emb_{t+1}). Forces encoder to
         # encode action-distinguishing features. Disabled when weight = 0.
@@ -166,6 +213,11 @@ class JEPAWorldModel(nn.Module):
         self.sigreg_weight = cfg.get("sigreg_weight", 0.1)
         self.reward_weight = cfg.get("reward_weight", 10.0)
         self.use_symlog = cfg.get("use_symlog", True)
+        # v19+ reward loss: "sum" = legacy .sum(dim=1) (effective 300x/frame,
+        # collapses to constant-0 on sparse rewards), "event" = weighted mean
+        # with non-zero-reward frames upweighted by reward_event_weight.
+        self.reward_loss_mode = cfg.get("reward_loss_mode", "sum")
+        self.reward_event_weight = cfg.get("reward_event_weight", 30.0)
 
         self.embed_dim = embed_dim
         self.act_dim = act_dim
@@ -237,14 +289,15 @@ class JEPAWorldModel(nn.Module):
         ):
             target_p.data.mul_(decay).add_(online_p.data, alpha=1.0 - decay)
 
-    def forward(self, obs, actions, rewards, dones=None):
+    def forward(self, obs, actions, rewards, dones=None, global_step: int = 0):
         """Forward pass for training.
 
         Args:
-            obs:     (B, T, C, H, W)
-            actions: (B, T, act_dim) one-hot
-            rewards: (B, T)
-            dones:   (B, T) float32, 1.0 at terminal steps (optional)
+            obs:         (B, T, C, H, W)
+            actions:     (B, T, act_dim) one-hot
+            rewards:     (B, T)
+            dones:       (B, T) float32, 1.0 at terminal steps (optional)
+            global_step: env-step counter (used for the CPC weight ramp)
 
         Returns:
             losses dict, extra info dict
@@ -294,16 +347,22 @@ class JEPAWorldModel(nn.Module):
             pred = self.predictor(embeddings[:, :-1], actions[:, :-1])  # (B,T-1,D)
             # MSE-equivalent metric for gate (predictor output vs target emb)
             pred_mse = F.mse_loss(pred, target_emb[:, 1:])
-            # BYOL training loss: project + predict, cosine sim against EMA target
-            pred_proj = self.online_projection_head(
-                pred.reshape(B * (T - 1), self.embed_dim)
-            )
-            pred_proj = self.online_prediction_head(pred_proj)
-            pred_proj = pred_proj.reshape(B, T - 1, self.embed_dim)
-            target_for_pred = target_proj_seq[:, 1:]  # already detached
-            cos_sim = F.cosine_similarity(pred_proj, target_for_pred, dim=-1)  # (B,T-1)
-            pred_byol = (1.0 - cos_sim).mean()
-            pred_loss = pred_byol
+            if self.predictor_loss_mode == "mse_target":
+                # v19+: train the predictor IN embedding space. Projection
+                # heads are fully decoupled from the predictor path.
+                pred_loss = pred_mse
+            else:
+                # v18 "byol" (kept for reproducibility — verified dead end):
+                # project + predict, cosine sim against EMA target
+                pred_proj = self.online_projection_head(
+                    pred.reshape(B * (T - 1), self.embed_dim)
+                )
+                pred_proj = self.online_prediction_head(pred_proj)
+                pred_proj = pred_proj.reshape(B, T - 1, self.embed_dim)
+                target_for_pred = target_proj_seq[:, 1:]  # already detached
+                cos_sim = F.cosine_similarity(pred_proj, target_for_pred, dim=-1)
+                pred_byol = (1.0 - cos_sim).mean()
+                pred_loss = pred_byol
             pred_mean = pred  # for diagnostic cosine
             pred_logvar_mean = None
         elif self.stochastic_predictor:
@@ -348,20 +407,25 @@ class JEPAWorldModel(nn.Module):
                 online_target = embeddings[:, HS + k]
 
                 if self.use_ema_target:
-                    # BYOL rollout: predictor output → online proj+pred,
-                    # target = stop_grad EMA-projected next observation
                     pred_seq = self.predictor(ctx_e, ctx_a)
                     next_pred_emb = pred_seq[:, -1].clamp(-10, 10)
-                    step_proj = self.online_projection_head(next_pred_emb)
-                    step_proj = self.online_prediction_head(step_proj)
-                    step_target = target_proj_seq[:, HS + k]  # already detached
-                    cos = F.cosine_similarity(step_proj, step_target, dim=-1)
-                    step_loss_train = (1.0 - cos).mean()
-                    rollout_terms_train.append(step_loss_train)
-                    # MSE-equivalent for metric (vs target encoder embedding)
-                    rollout_terms_mse.append(
-                        F.mse_loss(next_pred_emb, target_emb[:, HS + k]).detach()
-                    )
+                    if self.predictor_loss_mode == "mse_target":
+                        # v19+: K-step rollout trained in embedding space
+                        step_mse = F.mse_loss(next_pred_emb, target_emb[:, HS + k])
+                        rollout_terms_train.append(step_mse)
+                        rollout_terms_mse.append(step_mse.detach())
+                    else:
+                        # v18 BYOL rollout (dead end, kept for reproducibility):
+                        # predictor output → online proj+pred vs EMA target proj
+                        step_proj = self.online_projection_head(next_pred_emb)
+                        step_proj = self.online_prediction_head(step_proj)
+                        step_target = target_proj_seq[:, HS + k]  # detached
+                        cos = F.cosine_similarity(step_proj, step_target, dim=-1)
+                        rollout_terms_train.append((1.0 - cos).mean())
+                        # MSE-equivalent for metric (vs target encoder embedding)
+                        rollout_terms_mse.append(
+                            F.mse_loss(next_pred_emb, target_emb[:, HS + k]).detach()
+                        )
                     next_pred = next_pred_emb
                 elif self.stochastic_predictor:
                     m_seq, lv_seq = self.predictor(ctx_e, ctx_a, return_dist=True)
@@ -402,9 +466,25 @@ class JEPAWorldModel(nn.Module):
             [torch.zeros_like(rewards[:, :1]), rewards[:, :-1]], dim=1
         )
         target_reward = symlog(shifted_rewards) if self.use_symlog else shifted_rewards
-        reward_loss = F.mse_loss(
-            reward_pred, target_reward, reduction="none"
-        ).sum(dim=1).mean()
+        reward_se = F.mse_loss(reward_pred, target_reward, reduction="none")  # (B,T)
+        event_mask = (target_reward.abs() > 1e-6).float()
+        if self.reward_loss_mode == "event":
+            # v19+ fix: the old `.sum(dim=1)` over T=30 with reward_weight=10
+            # gave an effective 300x per-frame weight whose optimum on ~0.5%
+            # non-zero-reward Pong is the constant 0 (verified: v18 ended with
+            # reward_pred_sparsity=0.98, imagined_reward~0). Weighted MEAN with
+            # event upweighting makes reward events dominate the loss instead.
+            w = 1.0 + self.reward_event_weight * event_mask
+            reward_loss = (reward_se * w).sum() / w.sum()
+        else:
+            # v18 and earlier behavior (kept for reproducibility)
+            reward_loss = reward_se.sum(dim=1).mean()
+        with torch.no_grad():
+            n_events = event_mask.sum()
+            reward_event_mse = (
+                (reward_se * event_mask).sum() / n_events
+                if n_events > 0 else torch.zeros((), device=obs.device)
+            )
 
         # ── Continuation prediction ──
         if dones is not None:
@@ -453,6 +533,35 @@ class JEPAWorldModel(nn.Module):
             inv_dyn_loss = torch.zeros(1, device=obs.device)
             inv_dyn_acc = torch.zeros(1, device=obs.device)
 
+        # ── v19/v20: BYOL encoder-only aux (same-timestep self-distillation) ──
+        # online emb_t -> proj -> pred vs stop-grad EMA target proj_t.
+        # The dynamics predictor is NOT involved (v18 lesson).
+        if self.byol_encoder_weight > 0:
+            flat_online = embeddings.reshape(B * T, self.embed_dim)
+            enc_proj = self.online_prediction_head(
+                self.online_projection_head(flat_online)
+            )
+            enc_target = target_proj_seq.reshape(B * T, self.embed_dim)  # detached
+            byol_enc_loss = (
+                1.0 - F.cosine_similarity(enc_proj, enc_target, dim=-1)
+            ).mean()
+        else:
+            byol_enc_loss = torch.zeros(1, device=obs.device)
+
+        # ── v20: action-conditioned CPC aux on encoder ──
+        # Weight ramps 0 -> cpc_weight over cpc_ramp_steps env steps.
+        cpc_diag = {}
+        if self.cpc is not None:
+            if self.cpc_ramp_steps > 0:
+                ramp = min(1.0, global_step / self.cpc_ramp_steps)
+            else:
+                ramp = 1.0
+            cpc_scale = self.cpc_weight * ramp
+            cpc_loss, cpc_diag = self.cpc(embeddings, target_emb, actions)
+        else:
+            cpc_scale = 0.0
+            cpc_loss = torch.zeros(1, device=obs.device)
+
         # ── Total loss ──
         total_loss = (
             self.pred_weight * pred_loss
@@ -462,6 +571,8 @@ class JEPAWorldModel(nn.Module):
             + cont_loss
             + self.aux_recon_weight * aux_recon_loss
             + self.inv_dyn_weight * inv_dyn_loss
+            + self.byol_encoder_weight * byol_enc_loss
+            + cpc_scale * cpc_loss
         )
 
         # Logged "pred" / "rollout" stay MSE-equivalent so wm/pred is comparable
@@ -489,9 +600,13 @@ class JEPAWorldModel(nn.Module):
         if self.stochastic_predictor:
             losses["pred_nll"] = pred_loss.detach()
             losses["rollout_nll"] = rollout_loss.detach() if torch.is_tensor(rollout_loss) else rollout_loss
-        if self.use_ema_target:
+        if self.use_ema_target and self.predictor_loss_mode == "byol":
             losses["pred_byol"] = pred_loss.detach()
             losses["rollout_byol"] = rollout_loss.detach() if torch.is_tensor(rollout_loss) else rollout_loss
+        if self.byol_encoder_weight > 0:
+            losses["byol_enc"] = byol_enc_loss.detach()
+        if self.cpc is not None:
+            losses["cpc"] = cpc_loss.detach()
         # ── Inline diagnostics (cheap stats on existing tensors) ──
         with torch.no_grad():
             # pred_cosine compares predictor output to actual next embedding
@@ -508,11 +623,15 @@ class JEPAWorldModel(nn.Module):
                 "reward_pred_sparsity": (
                     reward_pred.abs() < 0.1
                 ).float().mean().item(),
+                "reward_event_mse": reward_event_mse.item(),
             }
             if pred_logvar_mean is not None:
                 diag["pred_logvar_mean"] = pred_logvar_mean.item()
             if self.inv_dyn_head is not None:
                 diag["inv_dyn_acc"] = inv_dyn_acc.item()
+            if self.cpc is not None:
+                diag["cpc_scale"] = cpc_scale
+                diag.update(cpc_diag)
 
             # ── Long-horizon rollout diagnostic ──
             # Mimics imagination procedure: autoregressive predictor with
@@ -590,7 +709,16 @@ class JEPAWorldModelTrainer:
 
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
-    def train_step(self, batch: dict) -> tuple[dict, dict]:
+    @staticmethod
+    def _module_grad_norm(module: nn.Module) -> float:
+        """L2 norm of all gradients in a module (0.0 if no grads)."""
+        sq = 0.0
+        for p in module.parameters():
+            if p.grad is not None:
+                sq += p.grad.pow(2).sum().item()
+        return sq ** 0.5
+
+    def train_step(self, batch: dict, global_step: int = 0) -> tuple[dict, dict]:
         obs = batch["obs"].to(self.device)
         actions = batch["action"].to(self.device)
         rewards = batch["reward"].to(self.device)
@@ -601,7 +729,9 @@ class JEPAWorldModelTrainer:
         self.optimizer.zero_grad()
 
         with autocast(device_type="cuda", enabled=self.use_amp):
-            losses, info = self.model(obs, actions, rewards, dones=dones)
+            losses, info = self.model(
+                obs, actions, rewards, dones=dones, global_step=global_step
+            )
 
         if torch.isnan(losses["total"]) or torch.isinf(losses["total"]):
             print(f"WARNING: NaN/Inf in total loss, skipping step. "
@@ -610,6 +740,19 @@ class JEPAWorldModelTrainer:
 
         self.scaler.scale(losses["total"]).backward()
         self.scaler.unscale_(self.optimizer)
+        # Per-head grad norms BEFORE clipping — task-harmonization telemetry
+        # (detects one objective starving the others; cf. HarmonyDream)
+        head_grads = {
+            "grad_encoder": self._module_grad_norm(self.model.encoder),
+            "grad_predictor": self._module_grad_norm(self.model.predictor),
+            "grad_reward_head": self._module_grad_norm(self.model.reward_pred),
+        }
+        if self.model.aux_decoder is not None:
+            head_grads["grad_aux_decoder"] = self._module_grad_norm(self.model.aux_decoder)
+        if self.model.inv_dyn_head is not None:
+            head_grads["grad_inv_dyn"] = self._module_grad_norm(self.model.inv_dyn_head)
+        if self.model.cpc is not None:
+            head_grads["grad_cpc"] = self._module_grad_norm(self.model.cpc)
         grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -624,6 +767,7 @@ class JEPAWorldModelTrainer:
         loss_dict = {k: v.item() for k, v in losses.items()}
         loss_dict["grad_norm"] = grad_norm.item()
         loss_dict["lr"] = self.optimizer.param_groups[0]["lr"]
+        loss_dict.update(head_grads)
         return loss_dict, info
 
 

@@ -1,0 +1,93 @@
+# v19 = v20 WITHOUT CPC. This is the designated FALLBACK/DIAGNOSIS config:
+# if v20 fails the @100k kill-gate, run this to isolate whether the repair
+# layer (MSE predictor + reward fix + hygiene) or CPC is the problem.
+# It doubles as the "v20 minus CPC" ablation for the paper.
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+use_ema_target: true
+target_ema_decay: 0.99
+
+# v19 core: predictor anchored in embedding space (see v20 config for the
+# full rationale — v18 run woofbf2z proved BYOL-on-predictor breaks
+# imagination via OOD embeddings and sign-flipped critic values).
+predictor_loss: mse_target
+byol_encoder_weight: 0.3
+inv_dyn_weight: 0.3
+
+# CPC OFF — the only difference from pong_jepa_v20.yaml
+cpc_weight: 0.0
+
+pred_weight: 1.0
+rollout_weight: 0.5
+use_symlog: true
+
+reward_weight: 10.0
+reward_loss_mode: event
+reward_event_weight: 30.0
+
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+ac_warmup_steps: 20000
+ac_gate_threshold: null
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+repval_weight: 0.3
+horizon_curriculum_ac_steps: 45000
+rollout_steps: 5
+
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+
+eval_every: 20000
+eval_episodes: 3
+frozen_eval_batch_size: 64
+
+buffer_max_steps: 200000
+
+reward_window_size: 50
+best_window_min_eps: 30
+
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v19-msepred"

@@ -170,6 +170,78 @@ def find_latest_checkpoint(ckpt_dir: Path):
     return ckpts[-1] if ckpts else None
 
 
+def run_greedy_eval(env, actor, wm, device, n_episodes=3, max_steps=12000):
+    """v19+: evaluate the argmax policy on a dedicated env.
+
+    The training reward window conflates exploration noise with policy
+    quality (sampled actions); this is the clean signal. Returns the list
+    of episode rewards.
+    """
+    actor.eval()
+    wm.encoder.eval()
+    wm.encoder_bn.eval()
+    rewards = []
+    try:
+        for _ in range(n_episodes):
+            obs, _ = env.reset()
+            total, steps, done = 0.0, 0, False
+            while not done and steps < max_steps:
+                obs_t = torch.tensor(obs[None], dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    emb = wm.encode(obs_t)
+                    dist = actor(emb)
+                    action = int(dist.probs.argmax(dim=-1).item())
+                obs, reward, terminated, truncated, _ = env.step(action)
+                total += reward
+                done = terminated or truncated
+                steps += 1
+            rewards.append(total)
+    finally:
+        actor.train()
+        wm.encoder.train()
+        wm.encoder_bn.train()
+    return rewards
+
+
+@torch.no_grad()
+def measure_imagination_diagnostics(wm, critic, frozen_batch, device):
+    """v19+: critic-divergence telemetry on a FROZEN reference batch.
+
+    The v18 failure signature was critic(pred_emb) flipping sign vs
+    critic(real_emb) (+0.5 vs -2.9) while replay loss stayed low. This
+    measures that divergence directly, every cycle, on a fixed batch so
+    values are comparable across training.
+    """
+    was_training = wm.training
+    wm.eval()
+    obs = frozen_batch["obs"].to(device)
+    acts = frozen_batch["action"].to(device)
+    emb = wm.encode(obs)                                    # (N, T, D)
+    D = emb.shape[-1]
+    pred = wm.predictor(emb[:, :-1], acts[:, :-1]).clamp(-10, 10)
+    v_real = critic(emb[:, 1:].reshape(-1, D))
+    v_pred = critic(pred.reshape(-1, D))
+    div = (v_pred - v_real).pow(2).mean().sqrt().item()
+    denom = max(v_real.abs().mean().item(), 1e-6)
+    # Embedding effective rank (PCA-99%) — collapse detector
+    e = emb.reshape(-1, D)
+    e = e - e.mean(0, keepdim=True)
+    sv = torch.linalg.svdvals(e.float())
+    energy = sv.pow(2)
+    cum = energy.cumsum(0) / energy.sum().clamp(min=1e-12)
+    eff_rank = int((cum < 0.99).sum().item()) + 1
+    if was_training:
+        wm.train()
+    return {
+        "diag/critic_divergence": div,
+        "diag/critic_divergence_rel": div / denom,
+        "diag/value_mean_real": v_real.mean().item(),
+        "diag/value_mean_pred": v_pred.mean().item(),
+        "diag/value_var": v_real.var().item(),
+        "diag/emb_effective_rank": float(eff_rank),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
@@ -279,6 +351,11 @@ def main():
         obs_channels=cfg.get("obs_channels", 4), seed=cfg["seed"],
     )
 
+    # ── Dedicated greedy-eval env (v19+) ──
+    eval_env = make_atari_env(
+        cfg["env"], n_frames=cfg.get("obs_channels", 4), seed=cfg["seed"] + 10000
+    )
+
     # ── Replay buffer ──
     buffer = EpisodeReplayBuffer(
         max_total_steps=cfg.get("buffer_max_steps", 2_000_000),
@@ -326,6 +403,20 @@ def main():
             buffer.add_episode(obs, actions, rewards, dones)
         collector._reset_all()
         print(f"Prefilled {prefill_steps} steps in {len(buffer)} episodes")
+
+    # ── Frozen eval batch for critic-divergence telemetry (v19+) ──
+    # Fixed reference so divergence values are comparable across training
+    # (review pre-flight fix #3: define the reference BEFORE the run).
+    frozen_eval_batch = None
+    try:
+        _fb = buffer.sample(cfg.get("frozen_eval_batch_size", 64),
+                            torch.device("cpu"))
+        if _fb["action"].dim() == 2:
+            _fb["action"] = F.one_hot(_fb["action"].long(), act_dim).float()
+        frozen_eval_batch = _fb
+        print(f"Frozen eval batch: {_fb['obs'].shape[0]} sequences")
+    except ValueError as e:
+        print(f"WARNING: no frozen eval batch ({e}); divergence telemetry off")
 
     # ── Main loop ──
     total_steps = cfg["total_steps"]
@@ -426,7 +517,9 @@ def main():
             for _ in range(n_train):
                 batch = prefetcher.get()
 
-                wm_losses, wm_info = wm_trainer.train_step(batch)
+                wm_losses, wm_info = wm_trainer.train_step(
+                    batch, global_step=global_step
+                )
 
                 # ── AC gating: metric-based or fixed warmup ──
                 ac_ready = global_step >= ac_warmup_steps
@@ -464,6 +557,11 @@ def main():
                     accumulated.setdefault(k, []).append(v)
 
             avg_losses = {k: sum(v) / len(v) for k, v in accumulated.items()}
+            # v19+: critic-divergence + rank telemetry on the frozen batch
+            if frozen_eval_batch is not None:
+                avg_losses.update(measure_imagination_diagnostics(
+                    wm, critic, frozen_eval_batch, device
+                ))
             logger.log_step(avg_losses, step=global_step)
         except torch.cuda.OutOfMemoryError as e:
             print(f"CUDA OOM at step {global_step}: {e}")
@@ -492,6 +590,22 @@ def main():
         if global_step % cfg.get("checkpoint_every", 10000) < collect_per_step + 1000:
             save_checkpoint()
 
+        # ── Greedy eval (v19+) ──
+        eval_every = cfg.get("eval_every", 0)
+        if eval_every and global_step % eval_every < collect_per_step:
+            eval_rewards = run_greedy_eval(
+                eval_env, actor, wm, device,
+                n_episodes=cfg.get("eval_episodes", 3),
+            )
+            logger.log_step({
+                "eval/greedy_reward": float(np.mean(eval_rewards)),
+                "eval/greedy_reward_min": float(np.min(eval_rewards)),
+                "eval/greedy_reward_max": float(np.max(eval_rewards)),
+            }, step=global_step)
+            print(f"Greedy eval @ {global_step}: "
+                  f"{[f'{r:.0f}' for r in eval_rewards]} "
+                  f"(mean {np.mean(eval_rewards):.1f})")
+
         crash_count = 0
 
       except KeyboardInterrupt:
@@ -513,6 +627,7 @@ def main():
         print("Recovering and continuing...")
 
     collector.close()
+    eval_env.close()
     logger.close()
     print(f"Training complete. {global_step} steps, {episode_count} episodes.")
 

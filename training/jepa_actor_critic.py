@@ -117,10 +117,18 @@ class JEPAActorCriticTrainer:
         # When ramp_steps == 0 (default), horizon stays fixed at self.horizon.
         # Source: NOVEL_TECHNIQUES.md #3 — smooths regime shift in returns
         # that caused v6's collapse from +11 → -12 in 40k steps.
+        #
+        # v19+ fix: horizon_curriculum_ac_steps counts AC TRAIN steps instead
+        # of env steps. The v18 global_step variant was a silent no-op on
+        # resume (resumed at 252k > 200k ramp -> horizon 15 from the first AC
+        # step) and ramps before AC even starts on fresh runs. AC-step keying
+        # means the ramp always covers actual AC training.
         self.horizon_curriculum_steps = cfg.get("horizon_curriculum_steps", 0)
+        self.horizon_curriculum_ac_steps = cfg.get("horizon_curriculum_ac_steps", 0)
         self.max_horizon = self.horizon  # store original target
         self._current_horizon = (
-            1 if self.horizon_curriculum_steps > 0 else self.horizon
+            1 if (self.horizon_curriculum_steps > 0
+                  or self.horizon_curriculum_ac_steps > 0) else self.horizon
         )
 
         # Return normalization — EMA of 5th/95th percentiles (for actor only)
@@ -235,13 +243,20 @@ class JEPAActorCriticTrainer:
         return self.critic.compute_loss(emb_seq_d[:, :T - 1], replay_returns)
 
     def _update_curriculum(self, global_step: int):
-        """Update self._current_horizon from global_step. No-op if curriculum disabled."""
-        if self.horizon_curriculum_steps <= 0:
+        """Update self._current_horizon. No-op if curriculum disabled.
+
+        Prefers AC-step keying (v19+); falls back to env-step keying for
+        v18 config compatibility.
+        """
+        if self.horizon_curriculum_ac_steps > 0:
+            step, ramp = self._ac_step_count, self.horizon_curriculum_ac_steps
+        elif self.horizon_curriculum_steps > 0:
+            step, ramp = global_step, self.horizon_curriculum_steps
+        else:
             self._current_horizon = self.max_horizon
             return
-        ramp = self.horizon_curriculum_steps
         # Linear ramp 1 → max_horizon over 'ramp' steps
-        h = 1 + (global_step * (self.max_horizon - 1)) // max(1, ramp)
+        h = 1 + (step * (self.max_horizon - 1)) // max(1, ramp)
         self._current_horizon = max(1, min(h, self.max_horizon))
 
     def imagine_rollout(self, initial_emb):
@@ -370,8 +385,18 @@ class JEPAActorCriticTrainer:
 
         start_emb = emb_seq[torch.arange(B), t_indices].detach()
 
-        # Imagination rollout
-        rollout = self.imagine_rollout(start_emb)
+        # Imagination rollout — v19+ hygiene: dropout must be OFF (the
+        # predictor was silently left in train mode through v18, injecting
+        # uncontrolled noise into every imagined trajectory). Mode restored
+        # even on exceptions so WM training is never affected.
+        predictor = self.world_model.predictor
+        pred_was_training = predictor.training
+        predictor.eval()
+        try:
+            rollout = self.imagine_rollout(start_emb)
+        finally:
+            if pred_was_training:
+                predictor.train()
         emb_imag, rewards, values, log_probs, entropies, conts = rollout
 
         # Skip AC update if imagination produced empty or NaN results

@@ -111,6 +111,14 @@ class JEPAActorCriticTrainer:
         # even when world-model imagination is poor.
         self.repval_weight = cfg.get("repval_weight", 0.0)
 
+        # Lag-0 (v21): value baseline for the actor REINFORCE signal.
+        # The actor previously trained on raw percentile-normalized returns
+        # with NO baseline subtracted — a high-variance signal that turns to
+        # pure noise once imagined values drift (v18/v20 sign-flip). DreamerV3
+        # uses advantage = (lambda_return - V) / return_scale. Behind a flag so
+        # v11/v18/v20 configs reproduce exactly (default off).
+        self.use_value_baseline = cfg.get("use_value_baseline", False)
+
         # v18: Imagination horizon curriculum.
         # h(step) = min(1 + step // ramp, max_horizon) where ramp ensures
         # horizon reaches max_horizon at step = horizon_curriculum_steps.
@@ -417,10 +425,18 @@ class JEPAActorCriticTrainer:
         # ── Return normalization for actor (percentile-based, DreamerV3-style) ──
         # Only used for actor REINFORCE signal, NOT for critic targets.
         self._update_return_stats(lambda_returns)
-        normed_returns = self._normalize_returns(lambda_returns)
 
-        # ── Actor loss ── REINFORCE with normalized returns
-        actor_loss = -(normed_returns.detach() * log_probs).mean() \
+        # ── Actor loss ── REINFORCE.
+        # With use_value_baseline (Lag-0/v21): advantage = (return - V)/scale,
+        # a proper baseline (matches DreamerV3) that stays informative even
+        # when the absolute value level drifts. Without it (v11/v18/v20): raw
+        # percentile-normalized returns, the original baseline-free signal.
+        if self.use_value_baseline:
+            scale, _ = self._return_scale_offset()
+            actor_signal = ((lambda_returns - values) / scale).detach()
+        else:
+            actor_signal = self._normalize_returns(lambda_returns).detach()
+        actor_loss = -(actor_signal * log_probs).mean() \
                      - self.entropy_coeff * entropies.mean()
 
         if torch.isnan(actor_loss) or torch.isinf(actor_loss):

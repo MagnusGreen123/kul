@@ -1,0 +1,170 @@
+# ─────────────────────────────────────────────────────────────────────────
+# v21 Lag-0 — the confound-killer.
+#
+# Hypothesis: the −7.83 (v11) → −18 (v18/v20) regression lives in the AC-side
+# additions, NOT the encoder/WM. v20 proved the representation is healthy
+# (pred_cos 0.943, cpc 0.99, inv_dyn 0.93, rank 229). This run keeps the v20
+# WM recipe BYTE-FOR-BYTE and reverts the actor-critic to v11's self-consistent
+# loop, plus the one obviously-correct fix the actor was missing (value
+# baseline). This combination — healthy v20 representation + v11 AC — has never
+# been run.
+#
+# Changes vs configs/pong_jepa_v20.yaml (AC-side only):
+#   - repval_weight: 0.3 → 0.0   (drop replay anchor → self-consistent critic;
+#                                  removes the two-distribution split that lets
+#                                  imagined values drift positive)
+#   - horizon_curriculum_ac_steps: 45000 → 0   (fixed horizon 15, as in v11)
+#   - use_value_baseline: false → true         (advantage = (R−V)/scale)
+# Everything WM-side (predictor MSE-anchor, BYOL-enc, inv-dyn, CPC, reward
+# event fix, EMA target, K=5 rollout) is IDENTICAL to v20.
+#
+# Outcomes (both redirect the plan):
+#   - recovers to ~−7 or better → regression was the AC additions; this is the
+#     trustworthy baseline to build the ambitious v21 (SF / offline-RL
+#     pessimism / adversarial manifold-matching) on top of.
+#   - still ~−18 → regression is an encoder↔AC interaction, not the AC
+#     additions. Redirects everything.
+# ─────────────────────────────────────────────────────────────────────────
+
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+# SIGReg — kept (anti-collapse via marginal isotropy; LeWM-style)
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# ── EMA target encoder (kept from v18/v20) ──
+use_ema_target: true
+target_ema_decay: 0.99
+
+# ── Predictor trained with MSE in EMBEDDING space (kept from v20) ──
+predictor_loss: mse_target
+
+# ── BYOL as ENCODER-ONLY aux (kept from v20) ──
+byol_encoder_weight: 0.3
+
+# ── Inverse dynamics aux head (kept from v20 — verified healthy) ──
+inv_dyn_weight: 0.3
+
+# ── action-conditioned CPC aux on the encoder (kept from v20) ──
+cpc_weight: 0.5
+cpc_horizons: [1, 3, 5]
+cpc_proj_dim: 128
+cpc_hidden_dim: 256
+cpc_temperature: 0.1
+cpc_var_weight: 1.0
+cpc_ramp_steps: 20000
+cpc_max_samples: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+use_symlog: true
+
+# ── reward loss per-event (kept from v20) ──
+reward_weight: 10.0
+reward_loss_mode: event
+reward_event_weight: 30.0
+
+# Auxiliary decoder — KEPT (commit e27868d: ball disappears without it)
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# ── Actor-critic — v11/v6 fast critic regime, self-consistent loop ──
+ac_warmup_steps: 20000
+ac_gate_threshold: null
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+# ── Lag-0 change #1: drop the replay anchor (v11 had repval_weight=0) ──
+# v18/v20 used 0.3, which trains the critic on BOTH imagined (0.7) and real
+# (0.3) embeddings. Because those two manifolds are separable, the critic
+# fits −3 on real and +0.97 on imagined — the imagined side (the one the
+# actor uses) drifts positive with no reward anchor. v11 trained the critic
+# ONLY on imagined embeddings: a self-consistent loop, no OOD split. → −7.83.
+repval_weight: 0.0
+
+# ── Lag-0 change #2: fixed horizon 15 (v11), curriculum off ──
+# The horizon curriculum is an unproven AC novelty (NOVEL_TECHNIQUES #3);
+# v11 used a fixed horizon and reached −7.83. Disable for a faithful v11 AC.
+horizon_curriculum_ac_steps: 0
+
+# ── Lag-0 change #3: value baseline for the actor (NEW flag) ──
+# advantage = (lambda_return − V)/return_scale, matching DreamerV3. The actor
+# previously used raw normalized returns with no baseline — high-variance,
+# and pure noise once values drift. Strict variance reduction.
+use_value_baseline: true
+
+# K-step autoregressive rollout training in WM (kept from v20 — it produced
+# the healthy representation; this is a WM-side setting, not AC)
+rollout_steps: 5
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+
+# Greedy eval (argmax policy)
+eval_every: 20000
+eval_episodes: 3
+frozen_eval_batch_size: 64
+
+# Buffer — v11 setting (200k = ~250 episodes, fresh data)
+buffer_max_steps: 200000
+
+# Breakthrough tracking
+reward_window_size: 50
+best_window_min_eps: 30
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v21-lag0-selfconsistent"
+
+# ── Kill-gates (pre-registered, checked manually in wandb) ──
+#   @100k: diag/value_mean_pred < 0 (right sign) AND diag/critic_divergence_rel
+#          well below v20's blow-up (v20 hit 1.0+ by 160k, peaked 5.85). With
+#          the anchor gone there is no two-distribution split to drive it —
+#          if div_rel still explodes, the OOD is intrinsic, not anchor-induced.
+#   @150k: episode/window_avg > −15 — else kill.
+#   @500k success: window_avg > −7 (matches/beats v11) AND eval/greedy_reward
+#          consistent → then ablate which single change mattered, and build the
+#          ambitious v21 on top.

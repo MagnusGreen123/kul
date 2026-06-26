@@ -119,6 +119,21 @@ class JEPAActorCriticTrainer:
         # v11/v18/v20 configs reproduce exactly (default off).
         self.use_value_baseline = cfg.get("use_value_baseline", False)
 
+        # v22: Prioritized reward-proximal imagination starts.
+        # v21 lag-0 diagnosis: imagination is reward-barren (imagined_reward
+        # ~= -0.01 the whole run; a 15-step rollout on sparse-reward Pong almost
+        # never contains a scoring event), so lambda-returns collapse to a PURE
+        # value bootstrap with no ground-truth anchor — the critic trains on its
+        # own predictions and drifts (window peaked -13.4 @304k then collapsed
+        # to -18.7). This biases a fraction of imagination start states to
+        # positions whose horizon (t, t+H] contains a REAL reward event, so the
+        # return chain is anchored by an actual reward. start states stay REAL
+        # embeddings and the rollout stays imagined+self-consistent — no
+        # real/imagined OOD split (the v18/v20 repval failure mode). Default off
+        # → v11/v20/v21 reproduce exactly. See log/v21lag0_result_2026-06-26.md.
+        self.prioritized_imag_start = cfg.get("prioritized_imag_start", False)
+        self.prioritized_imag_frac = cfg.get("prioritized_imag_frac", 0.5)
+
         # v18: Imagination horizon curriculum.
         # h(step) = min(1 + step // ramp, max_horizon) where ramp ensures
         # horizon reaches max_horizon at step = horizon_curriculum_steps.
@@ -267,6 +282,65 @@ class JEPAActorCriticTrainer:
         h = 1 + (step * (self.max_horizon - 1)) // max(1, ramp)
         self._current_horizon = max(1, min(h, self.max_horizon))
 
+    def _sample_starts(self, B, T, dones, real_rewards):
+        """Pick imagination start indices, one per batch row.
+
+        Default (v11/v20/v21): uniform over non-terminal, non-last positions.
+        v22 (prioritized_imag_start): for a fraction of rows, restrict to
+        positions whose imagination horizon (t, t+H] contains a REAL reward
+        event, anchoring the lambda-return chain with an actual reward instead
+        of a pure value bootstrap. Rows with no reachable event (or not picked)
+        fall back to uniform.
+
+        Returns:
+            (t_indices (B,), prioritized_frac, reachable_rate)
+        """
+        dev = self.device
+        idx = torch.arange(T, device=dev)
+        not_last = (idx < T - 1).unsqueeze(0)                    # (1, T)
+        if dones is not None:
+            valid = (dones < 0.5) & not_last                     # (B, T)
+        else:
+            valid = not_last.expand(B, T).clone()
+
+        # Backwards-compatible path — preserves exact v11/v20/v21 sampling.
+        if not (self.prioritized_imag_start and real_rewards is not None):
+            t_indices = torch.zeros(B, dtype=torch.long, device=dev)
+            for b in range(B):
+                valid_t = valid[b].nonzero(as_tuple=False).squeeze(-1)
+                if len(valid_t) == 0:
+                    valid_t = torch.arange(T - 1, device=dev)
+                t_indices[b] = valid_t[torch.randint(len(valid_t), (1,), device=dev)]
+            return t_indices, 0.0, 0.0
+
+        # ── v22 prioritized reward-proximal starts (vectorized) ──
+        # Reward at raw index j is realized at state j+1 (arrival convention,
+        # jepa_world_model.py:463-468). A start t "reaches" a reward if a
+        # realized event falls at an imagined state in [t+1, t+H].
+        H = max(1, int(self._current_horizon))
+        event = (real_rewards.abs() > 1e-6).float()              # (B, T) raw reward idx
+        realized = torch.zeros_like(event)
+        realized[:, 1:] = event[:, :-1]                          # shift to realized state
+        csum = torch.zeros(B, T + 1, device=dev)
+        csum[:, 1:] = torch.cumsum(realized, dim=1)
+        lo = (idx + 1).clamp(max=T)                              # first imagined state
+        hi = (idx + 1 + H).clamp(max=T)                          # exclusive end of (t, t+H]
+        events_in_window = csum[:, hi] - csum[:, lo]             # (B, T)
+        reach = valid & (events_in_window > 0)
+
+        coin = torch.rand(B, device=dev) < self.prioritized_imag_frac
+        use_prio = reach.any(dim=1) & coin                       # (B,)
+        sel = torch.where(use_prio.unsqueeze(1), reach, valid).float()
+        empty = sel.sum(dim=1) == 0                              # fully-terminal rows
+        if empty.any():
+            sel = torch.where(empty.unsqueeze(1), not_last.float().expand(B, T), sel)
+        t_indices = torch.multinomial(sel, 1).squeeze(1)
+        return (
+            t_indices,
+            use_prio.float().mean().item(),
+            reach.any(dim=1).float().mean().item(),
+        )
+
     def imagine_rollout(self, initial_emb):
         """Roll out in imagination using actor + predictor.
 
@@ -377,20 +451,10 @@ class JEPAActorCriticTrainer:
 
         B, T, _ = emb_seq.shape
 
-        # Pick random starting states, avoiding terminal and last step
-        if dones is not None:
-            valid = (dones < 0.5) & (
-                torch.arange(T, device=self.device).unsqueeze(0) < T - 1
-            )
-            t_indices = torch.zeros(B, dtype=torch.long, device=self.device)
-            for b in range(B):
-                valid_t = valid[b].nonzero(as_tuple=False).squeeze(-1)
-                if len(valid_t) == 0:
-                    valid_t = torch.arange(T - 1, device=self.device)
-                t_indices[b] = valid_t[torch.randint(len(valid_t), (1,))]
-        else:
-            t_indices = torch.randint(0, T - 1, (B,), device=self.device)
-
+        # Pick imagination start states (v22: optionally reward-proximal).
+        t_indices, prioritized_frac, imag_start_event_rate = self._sample_starts(
+            B, T, dones, real_rewards
+        )
         start_emb = emb_seq[torch.arange(B), t_indices].detach()
 
         # Imagination rollout — v19+ hygiene: dropout must be OFF (the
@@ -521,6 +585,8 @@ class JEPAActorCriticTrainer:
             "replay_critic_loss": replay_critic_loss_val,
             "current_horizon": float(self._current_horizon),
             "critic_lr": self.critic_opt.param_groups[0]["lr"],
+            "prioritized_frac": prioritized_frac,
+            "imag_start_event_rate": imag_start_event_rate,
         }
 
 

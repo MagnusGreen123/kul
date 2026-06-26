@@ -1,0 +1,172 @@
+# ─────────────────────────────────────────────────────────────────────────
+# v22 — Prioritized reward-proximal imagination starts.
+#
+# v21 lag-0 (h10kuks7) proved the self-consistent AC loop (repval=0, value
+# baseline) FIXES the v18/v20 sign-flip (critic_divergence_rel stayed <0.5 vs
+# v20's 1.38/peak 5.85) and produced the first real learning curve: window_avg
+# climbed -20.5 -> -13.4 @304k. But it then COLLAPSED to -18.7. Diagnosis
+# (log/v21lag0_result_2026-06-26.md): imagination is REWARD-BARREN
+# (imagined_reward ~= -0.01 the entire run; a 15-step rollout on Pong, which
+# scores ~1.5-3% of frames, almost never contains a reward event). With no
+# reward, compute_lambda_returns degenerates to a PURE value bootstrap chain
+# that trains the critic on its own predictions -> ungrounded drift.
+#
+# Fix (single variable vs v21 lag-0): bias a fraction of imagination START
+# states to positions whose horizon (t, t+H] contains a REAL reward event, so
+# the return chain is anchored by an actual reward. Start states remain REAL
+# encoder embeddings; the rollout stays imagined and self-consistent -> NO
+# real/imagined OOD split (that was the v18/v20 repval failure mode, which v21
+# already removed). This is the ONLY change from v21 lag-0.
+#
+# Why this and not a critic change: repo history (v7-v13, six critic variants)
+# converged on "critic is not the driver" — so attack the reward-barren DATA,
+# not the critic. Twin-critic/pessimism (#2) and WM-freeze (#4) are held as the
+# pre-registered escalation IF divergence still climbs here.
+#
+# Changes vs configs/pong_jepa_v21_lag0.yaml (one mechanism):
+#   + prioritized_imag_start: true
+#   + prioritized_imag_frac: 0.5   (half the batch reward-proximal, half uniform)
+#
+# Outcomes:
+#   - imagined_reward becomes clearly non-zero AND window_avg holds/climbs past
+#     -13 without late collapse (divergence_rel stays <0.5) -> reward-anchoring
+#     fixed the bootstrap drift. Build ambitious Lag-1 (successor features /
+#     offline-RL pessimism) on this. Then ablate prioritized_imag_frac.
+#   - still collapses -> reward-anchoring alone is insufficient; the drift is
+#     intrinsic to the bootstrap. Escalate to twin-critic pessimism (v23).
+# ─────────────────────────────────────────────────────────────────────────
+
+env: "PongNoFrameskip-v4"
+pixel_env: true
+seed: 42
+
+# JEPA encoder — CNN backbone + BatchNorm projector
+embed_dim: 256
+obs_channels: 4
+cnn_depth: 48
+
+# Predictor — transformer with AdaLN action conditioning
+pred_depth: 4
+pred_heads: 4
+pred_mlp_dim: 512
+pred_dropout: 0.1
+history_size: 3
+
+# SIGReg — kept (anti-collapse via marginal isotropy; LeWM-style)
+sigreg_weight: 0.1
+sigreg_knots: 17
+sigreg_projections: 1024
+
+# ── EMA target encoder (kept from v20) ──
+use_ema_target: true
+target_ema_decay: 0.99
+
+# ── Predictor trained with MSE in EMBEDDING space (kept from v20) ──
+predictor_loss: mse_target
+
+# ── BYOL as ENCODER-ONLY aux (kept from v20) ──
+byol_encoder_weight: 0.3
+
+# ── Inverse dynamics aux head (kept from v20 — verified healthy) ──
+inv_dyn_weight: 0.3
+
+# ── action-conditioned CPC aux on the encoder (kept from v20) ──
+cpc_weight: 0.5
+cpc_horizons: [1, 3, 5]
+cpc_proj_dim: 128
+cpc_hidden_dim: 256
+cpc_temperature: 0.1
+cpc_var_weight: 1.0
+cpc_ramp_steps: 20000
+cpc_max_samples: 1024
+
+# Loss weights
+pred_weight: 1.0
+rollout_weight: 0.5
+use_symlog: true
+
+# ── reward loss per-event (kept from v20) ──
+reward_weight: 10.0
+reward_loss_mode: event
+reward_event_weight: 30.0
+
+# Auxiliary decoder — KEPT (commit e27868d: ball disappears without it)
+aux_recon_weight: 1.0
+aux_decoder_depth: 32
+fg_weight: 50.0
+
+# ── Actor-critic — v11/v6 fast critic regime, self-consistent loop (v21) ──
+ac_warmup_steps: 20000
+ac_gate_threshold: null
+act_dim: 6
+mlp_units: 400
+horizon: 15
+gamma: 0.997
+lambda_: 0.95
+entropy_coeff: 3.0e-3
+critic_ema_decay: 0.98
+critic_grad_clip: 1.5
+critic_lr: 1.0e-4
+
+# ── Self-consistent AC loop (kept from v21 lag-0) ──
+repval_weight: 0.0              # no replay anchor -> no OOD split
+horizon_curriculum_ac_steps: 0  # fixed horizon 15
+use_value_baseline: true        # advantage = (R - V)/scale
+
+# ── v22 — the one new mechanism: prioritized reward-proximal imagination ──
+prioritized_imag_start: true
+prioritized_imag_frac: 0.5
+
+# K-step autoregressive rollout training in WM (kept from v20 — WM-side)
+rollout_steps: 5
+
+# Training
+batch_size: 512
+batch_length: 30
+learning_rate: 1.0e-4
+actor_lr: 1.0e-4
+max_grad_norm: 2.0
+mixed_precision: false
+warmup_steps: 5000
+lr_schedule: cosine
+
+# Parallel collection
+n_envs: 24
+collect_per_step: 4000
+train_ratio: 0.25
+
+# Schedule
+prefill_steps: 10000
+total_steps: 500000
+checkpoint_every: 50000
+log_every: 4000
+
+# Greedy eval (argmax policy)
+eval_every: 20000
+eval_episodes: 3
+frozen_eval_batch_size: 64
+
+# Buffer — v11 setting (200k = ~250 episodes, fresh data)
+buffer_max_steps: 200000
+
+# Breakthrough tracking
+reward_window_size: 50
+best_window_min_eps: 30
+
+# Wandb
+wandb_project: "dreamer"
+use_wandb: true
+run_name: "jepa-v22-prioritized-imag"
+
+# ── Kill-gates (pre-registered, checked manually in wandb) ──
+#   MECHANISM CHECK @ first AC logs (post-warmup ~24k): ac/prioritized_frac ~0.5
+#       and ac/imagined_reward magnitude clearly > v21's 0.008 (e.g. |.|>0.05).
+#       If imagined_reward stays ~0, the predictor isn't carrying reward events
+#       through the rollout -> mechanism dead, stop and seed rollout history.
+#   @150k: episode/window_avg > -15 (v21 was -19.9 @144k; reward anchor should
+#       accelerate the climb) AND diag/critic_divergence_rel < 0.6.
+#   @300k: window_avg > -13 (must beat v21's -13.4 peak) AND not yet collapsing
+#       (divergence_rel flat or falling).
+#   @500k success: window_avg > -7 (matches/beats v11) with NO late collapse.
+#       Then ablate prioritized_imag_frac (0.5 -> 0.25/1.0) and confirm it was
+#       the lever. If collapse persists -> escalate to twin-critic pessimism.
